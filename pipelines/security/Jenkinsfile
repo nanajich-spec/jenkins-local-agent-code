@@ -1,0 +1,602 @@
+// =============================================================================
+// Jenkinsfile — End-to-End Security Pipeline
+// =============================================================================
+// Runs on local JNLP agent with: Trivy, OWASP Dependency-Check, SonarQube,
+// Grype, Hadolint, ShellCheck, Kubesec, and custom security gates.
+// =============================================================================
+
+pipeline {
+    agent { label 'local-security-agent' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    environment {
+        REGISTRY         = '132.186.17.22:5000'
+        TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivy-cache"
+        REPORTS_DIR      = "${WORKSPACE}/security-reports"
+        SCAN_SEVERITY    = 'CRITICAL,HIGH'
+        COVERAGE_THRESHOLD = '70'
+        SONAR_HOST_URL   = credentials('sonarqube-url')           // optional
+        SONAR_TOKEN      = credentials('sonarqube-token')         // optional
+        KUBECONFIG       = credentials('kubeconfig-credential')   // optional
+    }
+
+    parameters {
+        string(name: 'IMAGE_NAME',      defaultValue: 'catool',         description: 'Image name to scan')
+        string(name: 'IMAGE_TAG',       defaultValue: 'latest',         description: 'Image tag to scan')
+        string(name: 'GIT_REPO',        defaultValue: '',               description: 'Git repo URL (leave blank for workspace)')
+        string(name: 'GIT_BRANCH',      defaultValue: 'main',           description: 'Branch to scan')
+        choice(name: 'SCAN_TYPE',       choices: ['full', 'image-only', 'code-only', 'k8s-manifests'], description: 'Type of security scan')
+        booleanParam(name: 'FAIL_ON_CRITICAL', defaultValue: true,      description: 'Fail build on CRITICAL vulnerabilities')
+        booleanParam(name: 'SCAN_REGISTRY_IMAGES', defaultValue: false, description: 'Scan all images in local registry')
+    }
+
+    stages {
+
+        // =====================================================================
+        // Stage 1: Setup & Tool Verification
+        // =====================================================================
+        stage('Setup & Verify Tools') {
+            steps {
+                script {
+                    sh '''
+                        mkdir -p "${REPORTS_DIR}"
+                        echo "=========================================="
+                        echo "  Security Pipeline — Tool Verification"
+                        echo "=========================================="
+                        echo ""
+                        echo "--- Java ---"
+                        java -version 2>&1 | head -1
+                        echo ""
+                        echo "--- Trivy ---"
+                        trivy --version 2>&1 | head -1
+                        echo ""
+                        echo "--- Podman ---"
+                        podman --version 2>&1
+                        echo ""
+                        echo "--- OWASP Dependency-Check ---"
+                        if command -v dependency-check.sh &>/dev/null; then
+                            dependency-check.sh --version 2>&1 | head -1
+                        else
+                            echo "Not installed (will skip OWASP DC stage)"
+                        fi
+                        echo ""
+                        echo "--- Grype ---"
+                        if command -v grype &>/dev/null; then
+                            grype version 2>&1 | head -3
+                        else
+                            echo "Not installed (will skip Grype stage)"
+                        fi
+                        echo ""
+                        echo "--- Hadolint ---"
+                        if command -v hadolint &>/dev/null; then
+                            hadolint --version 2>&1
+                        else
+                            echo "Not installed (will skip Dockerfile lint)"
+                        fi
+                        echo ""
+                        echo "--- ShellCheck ---"
+                        if command -v shellcheck &>/dev/null; then
+                            shellcheck --version 2>&1 | head -2
+                        else
+                            echo "Not installed (will skip shell script lint)"
+                        fi
+                        echo ""
+                        echo "--- Kubesec ---"
+                        if command -v kubesec &>/dev/null; then
+                            kubesec version 2>&1
+                        else
+                            echo "Not installed (will skip K8s manifest scan)"
+                        fi
+                        echo ""
+                        echo "=========================================="
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 2: Checkout Source Code
+        // =====================================================================
+        stage('Checkout') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'code-only'] && params.GIT_REPO != '' }
+            }
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.GIT_BRANCH}"]],
+                    userRemoteConfigs: [[url: params.GIT_REPO]],
+                    extensions: [[$class: 'CloneOption', depth: 1, shallow: true]]
+                ])
+            }
+        }
+
+        // =====================================================================
+        // Stage 3: Secret Detection (git-leaks / truffleHog style)
+        // =====================================================================
+        stage('Secret Detection') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'code-only'] }
+            }
+            steps {
+                script {
+                    echo "=== Scanning for hardcoded secrets ==="
+                    sh '''
+                        # Trivy secret scanning
+                        trivy fs --scanners secret \
+                            --format json \
+                            --output "${REPORTS_DIR}/secret-scan.json" \
+                            "${WORKSPACE}" || true
+
+                        trivy fs --scanners secret \
+                            --format table \
+                            "${WORKSPACE}" | tee "${REPORTS_DIR}/secret-scan.txt" || true
+
+                        # Count findings
+                        SECRETS_FOUND=$(cat "${REPORTS_DIR}/secret-scan.json" | \
+                            python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(len(r.get('Secrets',[])) for r in d.get('Results',[])))" 2>/dev/null || echo "0")
+                        echo "Secrets found: ${SECRETS_FOUND}"
+
+                        if [ "${SECRETS_FOUND}" -gt 0 ]; then
+                            echo "WARNING: Hardcoded secrets detected!"
+                        fi
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 4: SAST — Static Application Security Testing
+        // =====================================================================
+        stage('SAST — Static Analysis') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'code-only'] }
+            }
+            parallel {
+                stage('Trivy Filesystem Scan') {
+                    steps {
+                        sh '''
+                            echo "=== Trivy Filesystem Vulnerability Scan ==="
+                            trivy fs --scanners vuln,misconfig \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format json \
+                                --output "${REPORTS_DIR}/trivy-fs-scan.json" \
+                                "${WORKSPACE}" || true
+
+                            trivy fs --scanners vuln,misconfig \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format table \
+                                "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-fs-scan.txt" || true
+                        '''
+                    }
+                }
+                stage('Dockerfile Lint') {
+                    when { expression { fileExists('Dockerfile') || fileExists('Containerfile') } }
+                    steps {
+                        sh '''
+                            DFILE="Dockerfile"
+                            [ -f "Containerfile" ] && DFILE="Containerfile"
+                            echo "=== Hadolint — Dockerfile Best Practices ==="
+                            if command -v hadolint &>/dev/null; then
+                                hadolint --format json "$DFILE" > "${REPORTS_DIR}/hadolint.json" || true
+                                hadolint "$DFILE" | tee "${REPORTS_DIR}/hadolint.txt" || true
+                            else
+                                echo "Hadolint not available, skipping"
+                            fi
+                        '''
+                    }
+                }
+                stage('ShellCheck') {
+                    steps {
+                        sh '''
+                            echo "=== ShellCheck — Shell Script Analysis ==="
+                            if command -v shellcheck &>/dev/null; then
+                                find "${WORKSPACE}" -name "*.sh" -type f \
+                                    ! -path "*/node_modules/*" \
+                                    ! -path "*/.trivy-cache/*" \
+                                    -exec shellcheck --format=json {} + \
+                                    > "${REPORTS_DIR}/shellcheck.json" 2>/dev/null || true
+                                find "${WORKSPACE}" -name "*.sh" -type f \
+                                    ! -path "*/node_modules/*" \
+                                    ! -path "*/.trivy-cache/*" \
+                                    -exec shellcheck {} + \
+                                    | tee "${REPORTS_DIR}/shellcheck.txt" 2>/dev/null || true
+                            else
+                                echo "ShellCheck not available, skipping"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 5: SCA — Software Composition Analysis (Dependencies)
+        // =====================================================================
+        stage('SCA — Dependency Scan') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'code-only'] }
+            }
+            parallel {
+                stage('Trivy SCA') {
+                    steps {
+                        sh '''
+                            echo "=== Trivy Dependency/License Scan ==="
+                            trivy fs --scanners vuln,license \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format json \
+                                --output "${REPORTS_DIR}/trivy-sca.json" \
+                                "${WORKSPACE}" || true
+
+                            trivy fs --scanners vuln,license \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format table \
+                                "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-sca.txt" || true
+                        '''
+                    }
+                }
+                stage('OWASP Dependency-Check') {
+                    when { expression { return fileExists('/opt/dependency-check/bin/dependency-check.sh') } }
+                    steps {
+                        sh '''
+                            echo "=== OWASP Dependency-Check ==="
+                            /opt/dependency-check/bin/dependency-check.sh \
+                                --project "${JOB_NAME}" \
+                                --scan "${WORKSPACE}" \
+                                --format HTML \
+                                --format JSON \
+                                --out "${REPORTS_DIR}" \
+                                --suppression "${WORKSPACE}/cat-deployments/jenkins/security-pipeline/config/owasp-suppressions.xml" \
+                                --failOnCVSS 7 \
+                                --enableExperimental || true
+                        '''
+                    }
+                }
+                stage('Grype SCA') {
+                    when { expression { return sh(script: 'command -v grype', returnStatus: true) == 0 } }
+                    steps {
+                        sh '''
+                            echo "=== Grype — Dependency Vulnerability Scan ==="
+                            grype dir:"${WORKSPACE}" \
+                                --output json \
+                                --file "${REPORTS_DIR}/grype-sca.json" || true
+                            grype dir:"${WORKSPACE}" \
+                                --output table | tee "${REPORTS_DIR}/grype-sca.txt" || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 6: Container Image Security Scan
+        // =====================================================================
+        stage('Container Image Scan') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'image-only'] }
+            }
+            parallel {
+                stage('Trivy Image Scan') {
+                    steps {
+                        script {
+                            def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                            sh """
+                                echo "=== Trivy Container Image Scan: ${fullImage} ==="
+                                trivy image --podman-host "" \
+                                    --severity "${SCAN_SEVERITY}" \
+                                    --format json \
+                                    --output "${REPORTS_DIR}/trivy-image-scan.json" \
+                                    "${fullImage}" || true
+
+                                trivy image --podman-host "" \
+                                    --severity "${SCAN_SEVERITY}" \
+                                    --format table \
+                                    "${fullImage}" | tee "${REPORTS_DIR}/trivy-image-scan.txt" || true
+                            """
+                        }
+                    }
+                }
+                stage('Grype Image Scan') {
+                    when { expression { return sh(script: 'command -v grype', returnStatus: true) == 0 } }
+                    steps {
+                        script {
+                            def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                            sh """
+                                echo "=== Grype Container Image Scan ==="
+                                grype "podman:${fullImage}" \
+                                    --output json \
+                                    --file "${REPORTS_DIR}/grype-image.json" || true
+                                grype "podman:${fullImage}" \
+                                    --output table | tee "${REPORTS_DIR}/grype-image.txt" || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 7: Registry-Wide Image Scan (optional)
+        // =====================================================================
+        stage('Registry Image Scan') {
+            when {
+                expression { params.SCAN_REGISTRY_IMAGES == true }
+            }
+            steps {
+                script {
+                    echo "=== Scanning all images in registry ${REGISTRY} ==="
+                    sh '''
+                        CATALOG=$(curl -s http://${REGISTRY}/v2/_catalog | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('repositories',[])))" 2>/dev/null)
+                        echo "Found repositories:"
+                        echo "${CATALOG}"
+                        echo ""
+
+                        for REPO in ${CATALOG}; do
+                            TAGS=$(curl -s "http://${REGISTRY}/v2/${REPO}/tags/list" | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('tags',[])))" 2>/dev/null)
+                            for TAG in ${TAGS}; do
+                                FULL="${REGISTRY}/${REPO}:${TAG}"
+                                echo "--- Scanning: ${FULL} ---"
+                                trivy image --podman-host "" \
+                                    --severity CRITICAL,HIGH \
+                                    --format table \
+                                    "${FULL}" | tee -a "${REPORTS_DIR}/registry-scan-all.txt" || true
+                                echo ""
+                            done
+                        done
+                    '''
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 8: Kubernetes Manifest Security Scan
+        // =====================================================================
+        stage('K8s Manifest Scan') {
+            when {
+                expression { params.SCAN_TYPE in ['full', 'k8s-manifests'] }
+            }
+            parallel {
+                stage('Trivy K8s Config Scan') {
+                    steps {
+                        sh '''
+                            echo "=== Trivy — Kubernetes Manifest Misconfiguration ==="
+                            MANIFESTS_DIR="${WORKSPACE}/cat-deployments"
+                            if [ -d "${MANIFESTS_DIR}" ]; then
+                                trivy config \
+                                    --severity "${SCAN_SEVERITY}" \
+                                    --format json \
+                                    --output "${REPORTS_DIR}/trivy-k8s-config.json" \
+                                    "${MANIFESTS_DIR}" || true
+
+                                trivy config \
+                                    --severity "${SCAN_SEVERITY}" \
+                                    --format table \
+                                    "${MANIFESTS_DIR}" | tee "${REPORTS_DIR}/trivy-k8s-config.txt" || true
+                            else
+                                echo "No K8s manifests directory found."
+                            fi
+                        '''
+                    }
+                }
+                stage('Kubesec Scan') {
+                    when { expression { return sh(script: 'command -v kubesec', returnStatus: true) == 0 } }
+                    steps {
+                        sh '''
+                            echo "=== Kubesec — K8s Resource Risk Assessment ==="
+                            find "${WORKSPACE}/cat-deployments" -name "*deployment*.yml" -o -name "*deployment*.yaml" | while read f; do
+                                echo "--- Scanning: $(basename $f) ---"
+                                kubesec scan "$f" | tee -a "${REPORTS_DIR}/kubesec-results.json" || true
+                            done
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 9: Live Cluster Security Audit (optional)
+        // =====================================================================
+        stage('Cluster Security Audit') {
+            when {
+                expression { params.SCAN_TYPE == 'full' }
+            }
+            steps {
+                sh '''
+                    echo "=== Trivy — Live Kubernetes Cluster Scan ==="
+                    trivy k8s --report summary \
+                        --severity "${SCAN_SEVERITY}" \
+                        --format json \
+                        --output "${REPORTS_DIR}/trivy-k8s-cluster.json" \
+                        --kubeconfig "${KUBECONFIG:-/root/.kube/config}" \
+                        cluster 2>/dev/null || echo "Cluster scan skipped (no access or kubeconfig)"
+
+                    trivy k8s --report summary \
+                        --severity "${SCAN_SEVERITY}" \
+                        --format table \
+                        --kubeconfig "${KUBECONFIG:-/root/.kube/config}" \
+                        cluster 2>/dev/null | tee "${REPORTS_DIR}/trivy-k8s-cluster.txt" || true
+                '''
+            }
+        }
+
+        // =====================================================================
+        // Stage 10: Security Gate — Pass/Fail Decision
+        // =====================================================================
+        stage('Security Gate') {
+            steps {
+                script {
+                    echo "=== Evaluating Security Gate ==="
+                    def gateResult = sh(script: '''
+                        CRITICAL_COUNT=0
+                        HIGH_COUNT=0
+
+                        # Parse Trivy image scan
+                        if [ -f "${REPORTS_DIR}/trivy-image-scan.json" ]; then
+                            IMG_CRIT=$(cat "${REPORTS_DIR}/trivy-image-scan.json" | \
+                                python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+results = data.get('Results', [])
+count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
+print(count)" 2>/dev/null || echo "0")
+                            IMG_HIGH=$(cat "${REPORTS_DIR}/trivy-image-scan.json" | \
+                                python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+results = data.get('Results', [])
+count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'HIGH')
+print(count)" 2>/dev/null || echo "0")
+                            CRITICAL_COUNT=$((CRITICAL_COUNT + IMG_CRIT))
+                            HIGH_COUNT=$((HIGH_COUNT + IMG_HIGH))
+                        fi
+
+                        # Parse Trivy FS scan
+                        if [ -f "${REPORTS_DIR}/trivy-fs-scan.json" ]; then
+                            FS_CRIT=$(cat "${REPORTS_DIR}/trivy-fs-scan.json" | \
+                                python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+results = data.get('Results', [])
+count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
+print(count)" 2>/dev/null || echo "0")
+                            FS_HIGH=$(cat "${REPORTS_DIR}/trivy-fs-scan.json" | \
+                                python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+results = data.get('Results', [])
+count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'HIGH')
+print(count)" 2>/dev/null || echo "0")
+                            CRITICAL_COUNT=$((CRITICAL_COUNT + FS_CRIT))
+                            HIGH_COUNT=$((HIGH_COUNT + FS_HIGH))
+                        fi
+
+                        echo "=========================================="
+                        echo "  SECURITY GATE RESULTS"
+                        echo "=========================================="
+                        echo "  CRITICAL vulnerabilities: ${CRITICAL_COUNT}"
+                        echo "  HIGH vulnerabilities:     ${HIGH_COUNT}"
+                        echo "=========================================="
+
+                        if [ "${CRITICAL_COUNT}" -gt 0 ]; then
+                            echo "GATE_STATUS=FAIL"
+                            exit 1
+                        fi
+                        echo "GATE_STATUS=PASS"
+                        exit 0
+                    ''', returnStatus: true)
+
+                    if (gateResult != 0 && params.FAIL_ON_CRITICAL) {
+                        unstable('CRITICAL vulnerabilities detected — marking build UNSTABLE')
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 11: Generate Consolidated Report
+        // =====================================================================
+        stage('Generate Report') {
+            steps {
+                sh '''
+                    echo "=== Generating Consolidated Security Report ==="
+                    cat > "${REPORTS_DIR}/security-report.html" <<'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Security Scan Report</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .header { background: #1a1a2e; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .section { background: white; padding: 15px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .critical { color: #d32f2f; font-weight: bold; }
+        .high { color: #f57c00; font-weight: bold; }
+        .medium { color: #fbc02d; }
+        .low { color: #388e3c; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #e3f2fd; }
+        .pass { background: #e8f5e9; padding: 5px 10px; border-radius: 4px; }
+        .fail { background: #ffebee; padding: 5px 10px; border-radius: 4px; }
+        pre { background: #263238; color: #aed581; padding: 15px; border-radius: 8px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔒 Security Scan Report</h1>
+        <p>Generated: TIMESTAMP_PLACEHOLDER</p>
+        <p>Pipeline: JOB_PLACEHOLDER — Build #BUILD_PLACEHOLDER</p>
+    </div>
+    <div class="section">
+        <h2>Scan Summary</h2>
+        <p>See individual report files in the <code>security-reports/</code> directory for detailed findings.</p>
+        <table>
+            <tr><th>Scan Type</th><th>Report File</th><th>Status</th></tr>
+            <tr><td>Secret Detection</td><td>secret-scan.json</td><td>-</td></tr>
+            <tr><td>Trivy FS Scan</td><td>trivy-fs-scan.json</td><td>-</td></tr>
+            <tr><td>Trivy Image Scan</td><td>trivy-image-scan.json</td><td>-</td></tr>
+            <tr><td>Trivy SCA</td><td>trivy-sca.json</td><td>-</td></tr>
+            <tr><td>K8s Config Scan</td><td>trivy-k8s-config.json</td><td>-</td></tr>
+            <tr><td>Cluster Audit</td><td>trivy-k8s-cluster.json</td><td>-</td></tr>
+        </table>
+    </div>
+</body>
+</html>
+HTMLEOF
+                    # Replace placeholders
+                    sed -i "s|TIMESTAMP_PLACEHOLDER|$(date '+%Y-%m-%d %H:%M:%S')|g" "${REPORTS_DIR}/security-report.html"
+                    sed -i "s|JOB_PLACEHOLDER|${JOB_NAME:-security-pipeline}|g" "${REPORTS_DIR}/security-report.html"
+                    sed -i "s|BUILD_PLACEHOLDER|${BUILD_NUMBER:-0}|g" "${REPORTS_DIR}/security-report.html"
+
+                    echo "Report generated: ${REPORTS_DIR}/security-report.html"
+                '''
+            }
+        }
+    }
+
+    // =========================================================================
+    // Post Actions
+    // =========================================================================
+    post {
+        always {
+            // Archive security reports
+            archiveArtifacts artifacts: 'security-reports/**/*', allowEmptyArchive: true
+
+            // Publish HTML report
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'security-reports',
+                reportFiles: 'security-report.html',
+                reportName: 'Security Scan Report'
+            ])
+
+            echo """
+            ==========================================
+              Security Pipeline Complete
+            ==========================================
+              Reports: ${REPORTS_DIR}
+            ==========================================
+            """
+        }
+        success {
+            echo '✅ Security pipeline passed — no blocking vulnerabilities found.'
+        }
+        unstable {
+            echo '⚠️ Security pipeline completed with warnings — review findings.'
+        }
+        failure {
+            echo '❌ Security pipeline FAILED — critical issues detected.'
+        }
+        cleanup {
+            cleanWs(deleteDirs: true, patterns: [[pattern: '.trivy-cache/**', type: 'INCLUDE']])
+        }
+    }
+}

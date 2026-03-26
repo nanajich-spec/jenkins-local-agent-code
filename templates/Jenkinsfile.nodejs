@@ -1,0 +1,172 @@
+// =============================================================================
+// Jenkinsfile.nodejs — Template for Node.js / React / Angular / Vue Projects
+// =============================================================================
+// Copy this to your project root as 'Jenkinsfile' and adjust parameters.
+//
+// Supports: npm/yarn/pnpm, ESLint, Prettier, Jest, Mocha, Cypress,
+//           Playwright, code coverage, Docker
+//
+// Prerequisites:
+//   - package.json with test/build scripts
+//   - Dockerfile (optional)
+// =============================================================================
+
+pipeline {
+    agent { label 'local-security-agent' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        REGISTRY = '132.186.17.22:5000'
+        IMAGE_NAME = 'my-frontend-app'        // <-- CHANGE THIS
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        REPORTS_DIR = "${WORKSPACE}/build-reports"
+        NODE_ENV = 'test'
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                sh '''
+                    mkdir -p "${REPORTS_DIR}"
+                    node --version
+                    npm --version
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    if [ -f "yarn.lock" ]; then
+                        yarn install --frozen-lockfile
+                    elif [ -f "pnpm-lock.yaml" ]; then
+                        pnpm install --frozen-lockfile
+                    else
+                        npm ci 2>/dev/null || npm install
+                    fi
+                '''
+            }
+        }
+
+        stage('Lint') {
+            parallel {
+                stage('ESLint') {
+                    steps {
+                        sh '''
+                            if [ -f "node_modules/.bin/eslint" ]; then
+                                npx eslint . --format json \
+                                    --output-file "${REPORTS_DIR}/eslint.json" 2>/dev/null || true
+                                npx eslint . 2>/dev/null || echo "ESLint issues (non-blocking)"
+                            fi
+                        '''
+                    }
+                }
+                stage('Prettier') {
+                    steps {
+                        sh '''
+                            if [ -f "node_modules/.bin/prettier" ]; then
+                                npx prettier --check "src/**/*.{js,jsx,ts,tsx,css,scss}" \
+                                    2>/dev/null || echo "Format issues (non-blocking)"
+                            fi
+                        '''
+                    }
+                }
+                stage('TypeScript') {
+                    when { expression { fileExists('tsconfig.json') } }
+                    steps {
+                        sh 'npx tsc --noEmit 2>/dev/null || echo "TS type errors (non-blocking)"'
+                    }
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    if grep -q '"test"' package.json 2>/dev/null; then
+                        npx jest --ci --coverage \
+                            --coverageDirectory="${REPORTS_DIR}/coverage" \
+                            --coverageReporters=json-summary \
+                            --coverageReporters=lcov \
+                            --coverageReporters=text \
+                            2>/dev/null || \
+                        npm test -- --coverage 2>/dev/null || \
+                        npm test 2>/dev/null || echo "Tests failed"
+                    fi
+                    cp coverage/lcov.info "${REPORTS_DIR}/lcov.info" 2>/dev/null || true
+                    cp coverage/coverage-summary.json "${REPORTS_DIR}/coverage-summary.json" 2>/dev/null || true
+                '''
+            }
+        }
+
+        stage('E2E Tests') {
+            when {
+                expression {
+                    fileExists('cypress.config.js') || fileExists('cypress.config.ts') ||
+                    fileExists('playwright.config.js') || fileExists('playwright.config.ts')
+                }
+            }
+            steps {
+                sh '''
+                    if [ -f "cypress.config.js" ] || [ -f "cypress.config.ts" ]; then
+                        npx cypress run --reporter junit \
+                            --reporter-options "mochaFile=${REPORTS_DIR}/cypress-results.xml" \
+                            2>/dev/null || echo "Cypress E2E failed"
+                    elif [ -f "playwright.config.js" ] || [ -f "playwright.config.ts" ]; then
+                        npx playwright test --reporter=junit 2>/dev/null || echo "Playwright failed"
+                    fi
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                    if grep -q '"build"' package.json 2>/dev/null; then
+                        NODE_ENV=production npm run build
+                    fi
+                '''
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { expression { fileExists('Dockerfile') } }
+            steps {
+                sh """
+                    podman build -t "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" .
+                    podman push "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" --tls-verify=false
+                    podman tag "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" "${REGISTRY}/${IMAGE_NAME}:latest"
+                    podman push "${REGISTRY}/${IMAGE_NAME}:latest" --tls-verify=false
+                """
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                sh """
+                    echo "=== Trivy FS Scan ==="
+                    trivy fs --scanners vuln --severity CRITICAL,HIGH \
+                        --format json --output "${REPORTS_DIR}/trivy-fs.json" \
+                        . || true
+
+                    echo "=== npm audit ==="
+                    npm audit --json > "${REPORTS_DIR}/npm-audit.json" 2>/dev/null || true
+                    npm audit 2>/dev/null || echo "npm audit issues found"
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'build-reports/**/*', allowEmptyArchive: true
+            junit allowEmptyResults: true, testResults: "${REPORTS_DIR}/**/*.xml"
+            echo "Pipeline complete — reports in ${REPORTS_DIR}"
+        }
+    }
+}

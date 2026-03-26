@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonarqube
+  namespace: sonarqube
+  labels:
+    app: sonarqube
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sonarqube
+  template:
+    metadata:
+      labels:
+        app: sonarqube
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: inblrmanappph02
+      tolerations:
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      initContainers:
+        # SonarQube requires vm.max_map_count >= 262144 for Elasticsearch
+        - name: sysctl-init
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              sysctl -w vm.max_map_count=524288
+              sysctl -w fs.file-max=131072
+          securityContext:
+            privileged: true
+            runAsUser: 0
+        # Fix permissions on data volume
+        - name: volume-permissions
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              chown -R 1000:1000 /opt/sonarqube/data
+              chown -R 1000:1000 /opt/sonarqube/extensions
+              chown -R 1000:1000 /opt/sonarqube/logs
+              chown -R 1000:1000 /opt/sonarqube/temp
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/data
+              subPath: data
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/extensions
+              subPath: extensions
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/logs
+              subPath: logs
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/temp
+              subPath: temp
+      containers:
+        - name: sonarqube
+          image: sonarqube:lts-community
+          ports:
+            - containerPort: 9000
+              name: http
+          env:
+            - name: SONAR_JDBC_URL
+              value: "jdbc:postgresql://sonarqube-postgres:5432/sonarqube"
+            - name: SONAR_JDBC_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sonarqube-postgres-secrets
+                  key: POSTGRES_USER
+            - name: SONAR_JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sonarqube-postgres-secrets
+                  key: POSTGRES_PASSWORD
+            - name: SONAR_ES_BOOTSTRAP_CHECKS_DISABLE
+              value: "true"
+          volumeMounts:
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/data
+              subPath: data
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/extensions
+              subPath: extensions
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/logs
+              subPath: logs
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/temp
+              subPath: temp
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          startupProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 40
+          readinessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: sonarqube-data
+          persistentVolumeClaim:
+            claimName: sonarqube-data-pvc

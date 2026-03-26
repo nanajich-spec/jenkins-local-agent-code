@@ -1,0 +1,124 @@
+# =============================================================================
+# pipeline.yaml — CI/CD Pipeline Configuration
+# =============================================================================
+# Central configuration for the universal CI/CD pipeline.
+# Developers can copy this to their project root and customize.
+# =============================================================================
+
+pipeline:
+  name: ci-cd-pipeline
+  description: "Universal CI/CD Pipeline — Auto-detect language, build, test, deploy"
+
+# =============================================================================
+# Jenkins Connection
+# =============================================================================
+jenkins:
+  url: "http://132.186.17.25:32000"
+  credentials:
+    user: admin
+    # password via JENKINS_PASS env var
+
+# =============================================================================
+# Agent
+# =============================================================================
+agent:
+  label: "local-security-agent"
+  node: "inblrmanappph06"
+
+# =============================================================================
+# Container Registry
+# =============================================================================
+registry:
+  url: "132.186.17.22:5000"
+  scheme: "http"
+  insecure: true
+
+# =============================================================================
+# Language Support Matrix
+# =============================================================================
+# Auto-detection order (checked by file existence):
+#   1. requirements.txt / setup.py / pyproject.toml → python
+#   2. pom.xml → java-maven
+#   3. build.gradle / build.gradle.kts → java-gradle
+#   4. angular.json → angular
+#   5. package.json + react dep → react
+#   6. vue.config.js → vue
+#   7. package.json → nodejs
+#   8. go.mod → go
+#   9. *.csproj → dotnet
+
+languages:
+  python:
+    install: "pip install -r requirements.txt"
+    lint: "flake8, black, mypy, bandit"
+    test: "pytest --cov"
+    build: "python -m build"
+  java-maven:
+    install: "mvn dependency:resolve"
+    lint: "checkstyle, spotbugs"
+    test: "mvn test (JUnit, JaCoCo)"
+    build: "mvn package"
+  java-gradle:
+    install: "gradle dependencies"
+    lint: "checkstyle, spotbugs"
+    test: "gradle test (JUnit, JaCoCo)"
+    build: "gradle build"
+  nodejs:
+    install: "npm ci / yarn install"
+    lint: "eslint, prettier"
+    test: "jest / mocha"
+    build: "npm run build"
+  react:
+    install: "npm ci / yarn install"
+    lint: "eslint, prettier"
+    test: "jest, cypress/playwright (e2e)"
+    build: "npm run build"
+  angular:
+    install: "npm ci"
+    lint: "ng lint (eslint)"
+    test: "ng test (karma), cypress (e2e)"
+    build: "ng build --configuration production"
+  vue:
+    install: "npm ci / yarn install"
+    lint: "eslint, prettier"
+    test: "jest/vitest, cypress (e2e)"
+    build: "npm run build"
+  go:
+    install: "go mod download"
+    lint: "go vet, golangci-lint, gofmt"
+    test: "go test ./... -cover"
+    build: "go build"
+  dotnet:
+    install: "dotnet restore"
+    lint: "dotnet format"
+    test: "dotnet test (xUnit/NUnit)"
+    build: "dotnet publish"
+
+# =============================================================================
+# Test Configuration
+# =============================================================================
+tests:
+  unit_tests: true
+  integration_tests: false
+  e2e_tests: false
+  coverage_threshold: 70
+
+# =============================================================================
+# Quality & Security
+# =============================================================================
+quality:
+  lint: true
+  sonarqube:
+    enabled: true
+    host_url: "http://sonarqube.sonarqube.svc.cluster.local:9000"
+    project_key: "catool-project"
+  security_scan: true
+  fail_on_critical: true
+
+# =============================================================================
+# Deployment
+# =============================================================================
+deploy:
+  enabled: false
+  environment: "staging"
+  k8s_namespace: ""

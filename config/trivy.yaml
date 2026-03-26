@@ -1,0 +1,76 @@
+# =============================================================================
+# trivy.yaml — Trivy Scanner Configuration
+# =============================================================================
+# Place in project root or reference via TRIVY_CONFIG env var.
+# Docs: https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+# =============================================================================
+
+scan:
+  # Scanners to enable
+  scanners:
+    - vuln
+    - misconfig
+    - secret
+    - license
+
+  # Security checks
+  security-checks:
+    - vuln
+    - config
+    - secret
+
+severity:
+  - CRITICAL
+  - HIGH
+
+# Vulnerability options
+vulnerability:
+  type:
+    - os
+    - library
+  ignore-unfixed: false
+
+# Misconfiguration options  
+misconfiguration:
+  # Include successes in the report (passed checks)
+  include-non-failures: false
+
+# Secret scanning
+secret:
+  config: ""
+
+# License scanning
+license:
+  # Allowed licenses
+  forbidden:
+    - AGPL-1.0
+    - AGPL-3.0
+  # Categories that should cause failure
+  confidenceLevel: 0.9
+
+# Image scanning options
+image:
+  # For Podman-based environments
+  podman-host: ""
+  # Removed images layers
+  removed-pkgs: false
+
+# Cache
+cache:
+  dir: ".trivy-cache"
+  clear: false
+
+# Database
+db:
+  skip-update: false
+  no-progress: false
+
+# Output
+format: table
+output: ""
+
+# Exit code on findings
+exit-code: 0
+
+# Timeout
+timeout: 10m

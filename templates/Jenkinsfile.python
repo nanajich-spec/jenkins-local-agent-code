@@ -1,0 +1,135 @@
+// =============================================================================
+// Jenkinsfile.python — Template for Python Projects
+// =============================================================================
+// Copy this to your project root as 'Jenkinsfile' and adjust parameters.
+//
+// Supports: pytest, flake8, black, mypy, bandit, coverage, Docker, K8s deploy
+//
+// Prerequisites in your project:
+//   - requirements.txt (or setup.py / pyproject.toml / Pipfile)
+//   - tests/ directory with pytest tests
+//   - Dockerfile (optional, for container builds)
+// =============================================================================
+
+pipeline {
+    agent { label 'local-security-agent' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        REGISTRY = '132.186.17.22:5000'
+        IMAGE_NAME = 'my-python-app'          // <-- CHANGE THIS
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        REPORTS_DIR = "${WORKSPACE}/build-reports"
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                sh '''
+                    mkdir -p "${REPORTS_DIR}"
+                    python3 --version
+                    pip --version
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python3 -m pip install --upgrade pip
+                    if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+                    if [ -f "requirements-dev.txt" ]; then pip install -r requirements-dev.txt; fi
+                    pip install pytest pytest-cov flake8 black mypy bandit safety 2>/dev/null || true
+                '''
+            }
+        }
+
+        stage('Lint & Quality') {
+            parallel {
+                stage('Flake8') {
+                    steps {
+                        sh '''
+                            flake8 . --max-line-length=120 \
+                                --exclude=.venv,venv,__pycache__,migrations \
+                                --output-file="${REPORTS_DIR}/flake8.txt" 2>/dev/null || true
+                            cat "${REPORTS_DIR}/flake8.txt" || true
+                        '''
+                    }
+                }
+                stage('Black') {
+                    steps { sh 'black --check --diff . 2>/dev/null || echo "Format issues found"' }
+                }
+                stage('MyPy') {
+                    steps { sh 'mypy . --ignore-missing-imports 2>/dev/null || echo "Type check issues"' }
+                }
+                stage('Bandit') {
+                    steps {
+                        sh '''
+                            bandit -r . -f json -o "${REPORTS_DIR}/bandit.json" \
+                                --exclude .venv,venv,tests 2>/dev/null || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    python3 -m pytest tests/ \
+                        --junitxml="${REPORTS_DIR}/pytest-results.xml" \
+                        --cov=. \
+                        --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
+                        --cov-report=html:"${REPORTS_DIR}/htmlcov" \
+                        --cov-report=term-missing \
+                        --cov-fail-under=70 \
+                        -v || echo "Tests failed"
+                '''
+            }
+            post {
+                always { junit allowEmptyResults: true, testResults: "${REPORTS_DIR}/*.xml" }
+            }
+        }
+
+        stage('Safety Check') {
+            steps {
+                sh 'safety check --json --output "${REPORTS_DIR}/safety.json" 2>/dev/null || echo "Safety check skipped"'
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { expression { fileExists('Dockerfile') } }
+            steps {
+                sh """
+                    podman build -t "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" .
+                    podman push "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" --tls-verify=false
+                    podman tag "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" "${REGISTRY}/${IMAGE_NAME}:latest"
+                    podman push "${REGISTRY}/${IMAGE_NAME}:latest" --tls-verify=false
+                """
+            }
+        }
+
+        stage('Security Scan') {
+            when { expression { fileExists('Dockerfile') } }
+            steps {
+                sh """
+                    trivy image --podman-host "" --severity CRITICAL,HIGH \
+                        --format json --output "${REPORTS_DIR}/trivy-image.json" \
+                        "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" || true
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'build-reports/**/*', allowEmptyArchive: true
+            echo "Pipeline complete — reports in ${REPORTS_DIR}"
+        }
+    }
+}

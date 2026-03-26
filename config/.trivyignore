@@ -1,0 +1,8 @@
+# Trivy Ignore File
+# =================
+# List CVE IDs to suppress (one per line).
+# Use this for known false positives or accepted risks.
+# Document reason for each suppression.
+
+# Example:
+# CVE-2023-XXXXX   # Accepted risk — not exploitable in our context

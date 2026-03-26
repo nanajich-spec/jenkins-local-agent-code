@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    app: jenkins
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      serviceAccountName: jenkins
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: inblrmanappph02
+      tolerations:
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 0
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:lts
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50000
+              name: jnlp
+          env:
+            - name: JAVA_OPTS
+              value: "-Djenkins.install.runSetupWizard=false -Dhudson.model.DirectoryBrowserSupport.CSP="
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+            - name: jenkins-init
+              mountPath: /usr/share/jenkins/ref/init.groovy.d/security.groovy
+              subPath: security.groovy
+            - name: jenkins-agent-init
+              mountPath: /usr/share/jenkins/ref/init.groovy.d/configure-agent.groovy
+              subPath: configure-agent.groovy
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          startupProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+      volumes:
+        - name: jenkins-home
+          persistentVolumeClaim:
+            claimName: jenkins-pvc
+        - name: jenkins-init
+          configMap:
+            name: jenkins-init-groovy
+        - name: jenkins-agent-init
+          configMap:
+            name: jenkins-agent-init-groovy

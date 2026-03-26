@@ -1,0 +1,952 @@
+// =============================================================================
+// Jenkinsfile — Universal CI/CD Pipeline
+// =============================================================================
+// Supports: Python, Java/Maven/Gradle, Node.js/React/Angular/Vue, Go, .NET
+// Stages: Detect → Install → Lint → Test → Coverage → Build → Security → Deploy
+//
+// Usage: Place this Jenkinsfile in your project root, or reference from Jenkins
+//        job config. Language is auto-detected or set via LANGUAGE parameter.
+// =============================================================================
+
+pipeline {
+    agent { label params.AGENT_LABEL ?: 'local-security-agent' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        timeout(time: params.TIMEOUT_MINUTES?.toInteger() ?: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    environment {
+        REGISTRY         = "${params.REGISTRY ?: '132.186.17.22:5000'}"
+        REPORTS_DIR      = "${WORKSPACE}/build-reports"
+        COVERAGE_THRESHOLD = "${params.COVERAGE_THRESHOLD ?: '70'}"
+    }
+
+    parameters {
+        // Project settings
+        string(name: 'GIT_REPO',             defaultValue: '',               description: 'Git repo URL (leave blank for workspace/SCM)')
+        string(name: 'GIT_BRANCH',           defaultValue: 'main',           description: 'Branch to build')
+        choice(name: 'LANGUAGE',             choices: ['auto', 'python', 'java-maven', 'java-gradle', 'nodejs', 'react', 'angular', 'vue', 'go', 'dotnet'], description: 'Project language (auto-detect if unsure)')
+
+        // Docker settings
+        string(name: 'IMAGE_NAME',           defaultValue: '',               description: 'Docker image name (leave blank to skip Docker build)')
+        string(name: 'IMAGE_TAG',            defaultValue: 'latest',         description: 'Docker image tag')
+        string(name: 'REGISTRY',             defaultValue: '132.186.17.22:5000', description: 'Container registry URL')
+        string(name: 'DOCKERFILE_PATH',      defaultValue: 'Dockerfile',     description: 'Dockerfile path')
+
+        // Test settings
+        booleanParam(name: 'RUN_UNIT_TESTS',      defaultValue: true,   description: 'Run unit tests')
+        booleanParam(name: 'RUN_INTEGRATION_TESTS', defaultValue: false, description: 'Run integration tests')
+        booleanParam(name: 'RUN_E2E_TESTS',       defaultValue: false,  description: 'Run end-to-end tests')
+        string(name: 'COVERAGE_THRESHOLD',         defaultValue: '70',   description: 'Minimum code coverage %')
+
+        // Quality & Security
+        booleanParam(name: 'RUN_LINT',             defaultValue: true,   description: 'Run linting/code quality')
+        booleanParam(name: 'RUN_SECURITY_SCAN',    defaultValue: true,   description: 'Run security scanning (Trivy)')
+        booleanParam(name: 'RUN_SONARQUBE',        defaultValue: false,  description: 'Run SonarQube analysis')
+        booleanParam(name: 'FAIL_ON_CRITICAL',     defaultValue: true,   description: 'Fail on CRITICAL vulnerabilities')
+
+        // Deploy settings
+        booleanParam(name: 'DEPLOY_TO_K8S',        defaultValue: false,  description: 'Deploy to Kubernetes')
+        choice(name: 'DEPLOY_ENV',                 choices: ['staging', 'production'], description: 'Deployment environment')
+        string(name: 'K8S_NAMESPACE',              defaultValue: '',     description: 'Kubernetes namespace for deployment')
+
+        // Agent
+        string(name: 'AGENT_LABEL',               defaultValue: 'local-security-agent', description: 'Jenkins agent label')
+        string(name: 'TIMEOUT_MINUTES',            defaultValue: '60',   description: 'Pipeline timeout (minutes)')
+    }
+
+    stages {
+
+        // =====================================================================
+        // Stage 1: Checkout & Language Detection
+        // =====================================================================
+        stage('Checkout & Detect') {
+            steps {
+                script {
+                    // Checkout if Git repo provided
+                    if (params.GIT_REPO?.trim()) {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.GIT_BRANCH}"]],
+                            userRemoteConfigs: [[url: params.GIT_REPO]],
+                            extensions: [[$class: 'CloneOption', depth: 1, shallow: true]]
+                        ])
+                    }
+
+                    sh "mkdir -p '${REPORTS_DIR}'"
+
+                    // Auto-detect language
+                    env.DETECTED_LANG = params.LANGUAGE
+                    if (params.LANGUAGE == 'auto') {
+                        env.DETECTED_LANG = detectLanguage()
+                    }
+
+                    echo """
+                    ==========================================
+                      CI/CD Pipeline Started
+                    ==========================================
+                      Language:  ${env.DETECTED_LANG}
+                      Branch:    ${params.GIT_BRANCH}
+                      Image:     ${params.IMAGE_NAME ?: 'N/A'}
+                      Tests:     Unit=${params.RUN_UNIT_TESTS}, Integration=${params.RUN_INTEGRATION_TESTS}
+                    ==========================================
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 2: Install Dependencies
+        // =====================================================================
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                if [ -f "requirements.txt" ]; then
+                                    python3 -m pip install --upgrade pip
+                                    pip install -r requirements.txt
+                                fi
+                                if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+                                    pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+                                fi
+                                if [ -f "Pipfile" ]; then
+                                    pip install pipenv && pipenv install --dev
+                                fi
+                                # Install test/lint tools if not present
+                                pip install pytest pytest-cov flake8 black mypy bandit safety 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                if [ -f "pom.xml" ]; then
+                                    mvn dependency:resolve -q 2>/dev/null || true
+                                fi
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+                                    chmod +x gradlew 2>/dev/null || true
+                                    ./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null || true
+                                fi
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh '''
+                                if [ -f "yarn.lock" ]; then
+                                    yarn install --frozen-lockfile 2>/dev/null || yarn install
+                                elif [ -f "pnpm-lock.yaml" ]; then
+                                    pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+                                elif [ -f "package-lock.json" ] || [ -f "package.json" ]; then
+                                    npm ci 2>/dev/null || npm install
+                                fi
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                if [ -f "go.mod" ]; then
+                                    go mod download
+                                    go mod verify
+                                fi
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                PROJ=$(find . -name "*.csproj" -o -name "*.sln" | head -1)
+                                if [ -n "${PROJ}" ]; then
+                                    dotnet restore "${PROJ}"
+                                fi
+                            '''
+                            break
+
+                        default:
+                            echo "No dependency installation step for language: ${env.DETECTED_LANG}"
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 3: Lint & Code Quality
+        // =====================================================================
+        stage('Lint & Code Quality') {
+            when { expression { params.RUN_LINT } }
+            steps {
+                script {
+                    def lintFailed = false
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Flake8 — Python Linting ==="
+                                flake8 . --max-line-length=120 --exclude=.venv,venv,__pycache__,migrations \
+                                    --output-file="${REPORTS_DIR}/flake8-report.txt" \
+                                    --format=default 2>/dev/null || true
+                                cat "${REPORTS_DIR}/flake8-report.txt" 2>/dev/null || true
+
+                                echo ""
+                                echo "=== Black — Code Format Check ==="
+                                black --check --diff . 2>/dev/null || echo "Black formatting issues found (non-blocking)"
+
+                                echo ""
+                                echo "=== MyPy — Type Check ==="
+                                mypy . --ignore-missing-imports 2>/dev/null || echo "MyPy issues found (non-blocking)"
+
+                                echo ""
+                                echo "=== Bandit — Python Security Linter ==="
+                                bandit -r . -f json -o "${REPORTS_DIR}/bandit-report.json" \
+                                    --exclude .venv,venv,tests,test 2>/dev/null || true
+                                bandit -r . --exclude .venv,venv,tests,test 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                echo "=== Checkstyle / SpotBugs ==="
+                                mvn checkstyle:check -q 2>/dev/null || echo "Checkstyle issues found (non-blocking)"
+                                mvn spotbugs:check -q 2>/dev/null || echo "SpotBugs not configured (non-blocking)"
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                echo "=== Checkstyle / SpotBugs ==="
+                                ./gradlew checkstyleMain 2>/dev/null || gradle checkstyleMain 2>/dev/null || echo "Checkstyle not configured"
+                                ./gradlew spotbugsMain 2>/dev/null || gradle spotbugsMain 2>/dev/null || echo "SpotBugs not configured"
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh '''
+                                echo "=== ESLint ==="
+                                if [ -f "node_modules/.bin/eslint" ]; then
+                                    npx eslint . --format json --output-file "${REPORTS_DIR}/eslint-report.json" 2>/dev/null || true
+                                    npx eslint . 2>/dev/null || echo "ESLint issues found (non-blocking)"
+                                elif command -v eslint &>/dev/null; then
+                                    eslint . 2>/dev/null || echo "ESLint issues found"
+                                else
+                                    echo "ESLint not found, skipping"
+                                fi
+
+                                echo ""
+                                echo "=== Prettier — Format Check ==="
+                                if [ -f "node_modules/.bin/prettier" ]; then
+                                    npx prettier --check "src/**/*.{js,jsx,ts,tsx,css,scss}" 2>/dev/null || echo "Prettier issues found (non-blocking)"
+                                fi
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                echo "=== Go Vet ==="
+                                go vet ./... 2>&1 | tee "${REPORTS_DIR}/govet-report.txt" || true
+
+                                echo ""
+                                echo "=== golangci-lint ==="
+                                if command -v golangci-lint &>/dev/null; then
+                                    golangci-lint run --out-format json > "${REPORTS_DIR}/golangci-lint.json" 2>/dev/null || true
+                                    golangci-lint run 2>/dev/null || echo "golangci-lint issues found (non-blocking)"
+                                else
+                                    echo "golangci-lint not installed, skipping"
+                                fi
+
+                                echo ""
+                                echo "=== Go Format Check ==="
+                                UNFORMATTED=$(gofmt -l . 2>/dev/null)
+                                if [ -n "${UNFORMATTED}" ]; then
+                                    echo "Unformatted files: ${UNFORMATTED}"
+                                fi
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                echo "=== dotnet format check ==="
+                                dotnet format --verify-no-changes 2>/dev/null || echo "Format issues found (non-blocking)"
+                            '''
+                            break
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 4: Unit Tests
+        // =====================================================================
+        stage('Unit Tests') {
+            when { expression { params.RUN_UNIT_TESTS } }
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Pytest — Unit Tests ==="
+                                python3 -m pytest tests/ \
+                                    --junitxml="${REPORTS_DIR}/pytest-unit-results.xml" \
+                                    --cov=. \
+                                    --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
+                                    --cov-report=html:"${REPORTS_DIR}/htmlcov" \
+                                    --cov-report=term-missing \
+                                    --cov-fail-under="${COVERAGE_THRESHOLD}" \
+                                    -v 2>/dev/null || \
+                                python3 -m pytest \
+                                    --junitxml="${REPORTS_DIR}/pytest-unit-results.xml" \
+                                    --cov=. \
+                                    --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
+                                    --cov-report=term-missing \
+                                    -v 2>/dev/null || \
+                                echo "No tests found or pytest not configured"
+                            '''
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                echo "=== Maven — Unit Tests ==="
+                                mvn test -Dmaven.test.failure.ignore=true \
+                                    -Djacoco.destFile="${REPORTS_DIR}/jacoco.exec" 2>/dev/null || \
+                                mvn test -Dmaven.test.failure.ignore=true || echo "Tests failed"
+                                # Copy surefire reports
+                                cp -r target/surefire-reports/* "${REPORTS_DIR}/" 2>/dev/null || true
+                                cp target/site/jacoco/jacoco.xml "${REPORTS_DIR}/jacoco-coverage.xml" 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                echo "=== Gradle — Unit Tests ==="
+                                ./gradlew test --continue 2>/dev/null || gradle test --continue 2>/dev/null || echo "Tests failed"
+                                cp -r build/test-results/test/* "${REPORTS_DIR}/" 2>/dev/null || true
+                                cp build/reports/jacoco/test/jacocoTestReport.xml "${REPORTS_DIR}/jacoco-coverage.xml" 2>/dev/null || true
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh '''
+                                echo "=== Jest/Mocha — Unit Tests ==="
+                                # Try npm test with coverage
+                                if grep -q '"test"' package.json 2>/dev/null; then
+                                    npx jest --ci --coverage \
+                                        --coverageDirectory="${REPORTS_DIR}/coverage" \
+                                        --coverageReporters=json-summary --coverageReporters=lcov --coverageReporters=text \
+                                        --reporters=default --reporters=jest-junit \
+                                        2>/dev/null || \
+                                    npm test -- --coverage 2>/dev/null || \
+                                    npm test 2>/dev/null || echo "Tests failed or not configured"
+                                else
+                                    echo "No test script found in package.json"
+                                fi
+                                # Copy coverage
+                                cp coverage/lcov.info "${REPORTS_DIR}/lcov.info" 2>/dev/null || true
+                                cp coverage/coverage-summary.json "${REPORTS_DIR}/coverage-summary.json" 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                echo "=== Go Test — Unit Tests ==="
+                                go test ./... -v -count=1 \
+                                    -coverprofile="${REPORTS_DIR}/go-coverage.out" \
+                                    -json > "${REPORTS_DIR}/go-test-results.json" 2>&1 || \
+                                go test ./... -v -coverprofile="${REPORTS_DIR}/go-coverage.out" || echo "Tests failed"
+                                # Generate HTML coverage
+                                go tool cover -html="${REPORTS_DIR}/go-coverage.out" -o "${REPORTS_DIR}/go-coverage.html" 2>/dev/null || true
+                                # Show coverage percentage
+                                go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | tail -1 || true
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                echo "=== dotnet test — Unit Tests ==="
+                                TEST_PROJ=$(find . -name "*Test*.csproj" -o -name "*Tests*.csproj" | head -1)
+                                if [ -n "${TEST_PROJ}" ]; then
+                                    dotnet test "${TEST_PROJ}" \
+                                        --logger "trx;LogFileName=${REPORTS_DIR}/test-results.trx" \
+                                        --collect:"XPlat Code Coverage" \
+                                        --results-directory "${REPORTS_DIR}" \
+                                        -v normal || echo "Tests failed"
+                                else
+                                    dotnet test \
+                                        --logger "trx;LogFileName=${REPORTS_DIR}/test-results.trx" \
+                                        --collect:"XPlat Code Coverage" \
+                                        --results-directory "${REPORTS_DIR}" \
+                                        -v normal || echo "Tests failed"
+                                fi
+                            '''
+                            break
+                    }
+                }
+            }
+            post {
+                always {
+                    // Publish JUnit results if available
+                    junit allowEmptyResults: true, testResults: "${REPORTS_DIR}/**/*.xml"
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 5: Integration Tests
+        // =====================================================================
+        stage('Integration Tests') {
+            when { expression { params.RUN_INTEGRATION_TESTS } }
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Pytest — Integration Tests ==="
+                                python3 -m pytest tests/integration/ \
+                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
+                                    -v -m "integration" 2>/dev/null || \
+                                python3 -m pytest -m "integration" \
+                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
+                                    -v 2>/dev/null || echo "No integration tests found"
+                            '''
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                echo "=== Maven — Integration Tests ==="
+                                mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true \
+                                    || echo "Integration tests failed or not configured"
+                                cp -r target/failsafe-reports/* "${REPORTS_DIR}/" 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                echo "=== Gradle — Integration Tests ==="
+                                ./gradlew integrationTest --continue 2>/dev/null || \
+                                gradle integrationTest --continue 2>/dev/null || echo "Integration tests not configured"
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh '''
+                                echo "=== Integration Tests ==="
+                                if grep -q '"test:integration"' package.json 2>/dev/null; then
+                                    npm run test:integration 2>/dev/null || echo "Integration tests failed"
+                                elif grep -q '"test:e2e"' package.json 2>/dev/null; then
+                                    npm run test:e2e 2>/dev/null || echo "E2E tests failed"
+                                else
+                                    echo "No integration test script found in package.json"
+                                fi
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                echo "=== Go — Integration Tests ==="
+                                go test ./... -v -tags=integration \
+                                    -json > "${REPORTS_DIR}/go-integration-results.json" 2>&1 || echo "Integration tests failed"
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                echo "=== dotnet — Integration Tests ==="
+                                ITEST_PROJ=$(find . -name "*Integration*.csproj" | head -1)
+                                if [ -n "${ITEST_PROJ}" ]; then
+                                    dotnet test "${ITEST_PROJ}" \
+                                        --logger "trx;LogFileName=${REPORTS_DIR}/integration-results.trx" \
+                                        -v normal || echo "Integration tests failed"
+                                fi
+                            '''
+                            break
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 6: E2E Tests
+        // =====================================================================
+        stage('E2E Tests') {
+            when { expression { params.RUN_E2E_TESTS } }
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case ['react', 'angular', 'vue', 'nodejs']:
+                            sh '''
+                                echo "=== E2E Tests (Cypress / Playwright) ==="
+                                if [ -f "cypress.config.js" ] || [ -f "cypress.config.ts" ]; then
+                                    npx cypress run --reporter junit \
+                                        --reporter-options "mochaFile=${REPORTS_DIR}/cypress-results.xml" \
+                                        2>/dev/null || echo "Cypress E2E tests failed"
+                                elif [ -f "playwright.config.js" ] || [ -f "playwright.config.ts" ]; then
+                                    npx playwright test --reporter=junit \
+                                        2>/dev/null || echo "Playwright E2E tests failed"
+                                elif grep -q '"test:e2e"' package.json 2>/dev/null; then
+                                    npm run test:e2e 2>/dev/null || echo "E2E tests failed"
+                                else
+                                    echo "No E2E test framework detected"
+                                fi
+                            '''
+                            break
+
+                        case 'python':
+                            sh '''
+                                echo "=== Selenium / Playwright E2E Tests ==="
+                                python3 -m pytest tests/e2e/ \
+                                    --junitxml="${REPORTS_DIR}/pytest-e2e-results.xml" \
+                                    -v -m "e2e" 2>/dev/null || echo "No E2E tests found"
+                            '''
+                            break
+
+                        default:
+                            echo "E2E testing not configured for ${env.DETECTED_LANG}"
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 7: Coverage Gate
+        // =====================================================================
+        stage('Coverage Gate') {
+            when { expression { params.RUN_UNIT_TESTS } }
+            steps {
+                script {
+                    echo "=== Code Coverage Evaluation ==="
+                    def coverageResult = sh(script: """
+                        THRESHOLD=${COVERAGE_THRESHOLD}
+
+                        # Python coverage
+                        if [ -f "${REPORTS_DIR}/coverage.xml" ]; then
+                            COV=\$(python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/coverage.xml')
+rate = float(tree.getroot().attrib.get('line-rate', 0)) * 100
+print(f'{rate:.1f}')
+" 2>/dev/null || echo "0")
+                            echo "Python coverage: \${COV}%"
+                            echo "\${COV}" > "${REPORTS_DIR}/coverage-percent.txt"
+                        fi
+
+                        # Java (JaCoCo) coverage
+                        if [ -f "${REPORTS_DIR}/jacoco-coverage.xml" ]; then
+                            COV=\$(python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/jacoco-coverage.xml')
+counters = tree.findall('.//counter[@type=\"LINE\"]')
+missed = sum(int(c.get('missed',0)) for c in counters)
+covered = sum(int(c.get('covered',0)) for c in counters)
+total = missed + covered
+print(f'{(covered/total*100):.1f}' if total > 0 else '0')
+" 2>/dev/null || echo "0")
+                            echo "Java coverage: \${COV}%"
+                            echo "\${COV}" > "${REPORTS_DIR}/coverage-percent.txt"
+                        fi
+
+                        # JS/TS coverage (lcov)
+                        if [ -f "${REPORTS_DIR}/coverage-summary.json" ]; then
+                            COV=\$(python3 -c "
+import json
+with open('${REPORTS_DIR}/coverage-summary.json') as f:
+    data = json.load(f)
+print(f'{data[\"total\"][\"lines\"][\"pct\"]:.1f}')
+" 2>/dev/null || echo "0")
+                            echo "JS/TS coverage: \${COV}%"
+                            echo "\${COV}" > "${REPORTS_DIR}/coverage-percent.txt"
+                        fi
+
+                        # Go coverage
+                        if [ -f "${REPORTS_DIR}/go-coverage.out" ]; then
+                            COV=\$(go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | \
+                                tail -1 | grep -oP '[0-9.]+(?=%)' || echo "0")
+                            echo "Go coverage: \${COV}%"
+                            echo "\${COV}" > "${REPORTS_DIR}/coverage-percent.txt"
+                        fi
+
+                        # Check threshold
+                        if [ -f "${REPORTS_DIR}/coverage-percent.txt" ]; then
+                            COV=\$(cat "${REPORTS_DIR}/coverage-percent.txt")
+                            echo "Coverage: \${COV}% (threshold: \${THRESHOLD}%)"
+                            python3 -c "
+cov = float('\${COV}')
+threshold = float('\${THRESHOLD}')
+if cov < threshold:
+    print(f'FAIL: Coverage {cov}% is below threshold {threshold}%')
+    exit(1)
+else:
+    print(f'PASS: Coverage {cov}% meets threshold {threshold}%')
+    exit(0)
+"
+                        else
+                            echo "No coverage report found — skipping gate"
+                            exit 0
+                        fi
+                    """, returnStatus: true)
+
+                    if (coverageResult != 0) {
+                        unstable("Code coverage below threshold ${COVERAGE_THRESHOLD}%")
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 8: Build Application
+        // =====================================================================
+        stage('Build') {
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Python Build ==="
+                                if [ -f "setup.py" ]; then
+                                    python3 setup.py bdist_wheel 2>/dev/null || python3 setup.py build || true
+                                elif [ -f "pyproject.toml" ]; then
+                                    pip install build 2>/dev/null && python3 -m build 2>/dev/null || true
+                                else
+                                    echo "No build step needed (script-based project)"
+                                fi
+                            '''
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                echo "=== Maven Build ==="
+                                mvn package -DskipTests -q
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                echo "=== Gradle Build ==="
+                                ./gradlew build -x test 2>/dev/null || gradle build -x test
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh '''
+                                echo "=== NPM Build ==="
+                                if grep -q '"build"' package.json 2>/dev/null; then
+                                    npm run build
+                                else
+                                    echo "No build script in package.json"
+                                fi
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                echo "=== Go Build ==="
+                                CGO_ENABLED=0 go build -o "${REPORTS_DIR}/app-binary" ./... 2>/dev/null || \
+                                go build ./... || echo "Build completed"
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                echo "=== dotnet Build ==="
+                                dotnet build --configuration Release
+                                dotnet publish --configuration Release --output "${REPORTS_DIR}/publish"
+                            '''
+                            break
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 9: Docker Build & Push
+        // =====================================================================
+        stage('Docker Build & Push') {
+            when { expression { params.IMAGE_NAME?.trim() } }
+            steps {
+                script {
+                    def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                    def dfPath = params.DOCKERFILE_PATH ?: 'Dockerfile'
+
+                    sh """
+                        echo "=== Building Container Image: ${fullImage} ==="
+
+                        # Use podman (available on RHEL9)
+                        if command -v podman &>/dev/null; then
+                            podman build -t "${fullImage}" -f "${dfPath}" .
+                            echo "=== Pushing to Registry ==="
+                            podman push "${fullImage}" --tls-verify=false
+                        elif command -v docker &>/dev/null; then
+                            docker build -t "${fullImage}" -f "${dfPath}" .
+                            echo "=== Pushing to Registry ==="
+                            docker push "${fullImage}"
+                        else
+                            echo "ERROR: Neither podman nor docker found"
+                            exit 1
+                        fi
+
+                        echo "Image pushed: ${fullImage}"
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 10: Security Scan
+        // =====================================================================
+        stage('Security Scan') {
+            when { expression { params.RUN_SECURITY_SCAN } }
+            parallel {
+                stage('Filesystem Scan') {
+                    steps {
+                        sh """
+                            echo "=== Trivy Filesystem Scan ==="
+                            if command -v trivy &>/dev/null; then
+                                trivy fs --scanners vuln,misconfig,secret \
+                                    --severity CRITICAL,HIGH \
+                                    --format json \
+                                    --output "${REPORTS_DIR}/trivy-fs.json" \
+                                    "${WORKSPACE}" || true
+                                trivy fs --scanners vuln,misconfig,secret \
+                                    --severity CRITICAL,HIGH \
+                                    "${WORKSPACE}" || true
+                            fi
+                        """
+                    }
+                }
+                stage('Image Scan') {
+                    when { expression { params.IMAGE_NAME?.trim() } }
+                    steps {
+                        script {
+                            def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                            sh """
+                                echo "=== Trivy Image Scan: ${fullImage} ==="
+                                if command -v trivy &>/dev/null; then
+                                    trivy image --podman-host "" \
+                                        --severity CRITICAL,HIGH \
+                                        --format json \
+                                        --output "${REPORTS_DIR}/trivy-image.json" \
+                                        "${fullImage}" || true
+                                    trivy image --podman-host "" \
+                                        --severity CRITICAL,HIGH \
+                                        "${fullImage}" || true
+                                fi
+                            """
+                        }
+                    }
+                }
+                stage('Secret Detection') {
+                    steps {
+                        sh """
+                            echo "=== Secret Detection ==="
+                            if command -v trivy &>/dev/null; then
+                                trivy fs --scanners secret \
+                                    --format json \
+                                    --output "${REPORTS_DIR}/secret-scan.json" \
+                                    "${WORKSPACE}" || true
+                            fi
+                        """
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 11: SonarQube Analysis (optional)
+        // =====================================================================
+        stage('SonarQube') {
+            when { expression { params.RUN_SONARQUBE } }
+            steps {
+                script {
+                    withCredentials([
+                        string(credentialsId: 'sonarqube-url', variable: 'SONAR_HOST'),
+                        string(credentialsId: 'sonarqube-token', variable: 'SONAR_AUTH_TOKEN')
+                    ]) {
+                        sh """
+                            echo "=== SonarQube Analysis ==="
+                            if command -v sonar-scanner &>/dev/null; then
+                                sonar-scanner \
+                                    -Dsonar.host.url=\${SONAR_HOST} \
+                                    -Dsonar.token=\${SONAR_AUTH_TOKEN} \
+                                    -Dsonar.projectKey=${params.IMAGE_NAME ?: 'project'} \
+                                    -Dsonar.qualitygate.wait=true
+                            else
+                                echo "sonar-scanner not installed, skipping"
+                            fi
+                        """
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 12: Security Gate
+        // =====================================================================
+        stage('Security Gate') {
+            when { expression { params.RUN_SECURITY_SCAN } }
+            steps {
+                script {
+                    echo "=== Security Gate Evaluation ==="
+                    def gateResult = sh(script: '''
+                        CRITICAL_COUNT=0
+
+                        for REPORT in "${REPORTS_DIR}"/trivy-*.json; do
+                            [ -f "${REPORT}" ] || continue
+                            COUNT=$(python3 -c "
+import json
+with open('${REPORT}') as f:
+    data = json.load(f)
+count = sum(1 for r in data.get('Results',[]) for v in r.get('Vulnerabilities',[]) if v.get('Severity')=='CRITICAL')
+print(count)
+" 2>/dev/null || echo "0")
+                            CRITICAL_COUNT=$((CRITICAL_COUNT + COUNT))
+                        done
+
+                        echo "Total CRITICAL vulnerabilities: ${CRITICAL_COUNT}"
+                        if [ "${CRITICAL_COUNT}" -gt 0 ]; then
+                            echo "SECURITY GATE: FAIL"
+                            exit 1
+                        fi
+                        echo "SECURITY GATE: PASS"
+                        exit 0
+                    ''', returnStatus: true)
+
+                    if (gateResult != 0 && params.FAIL_ON_CRITICAL) {
+                        unstable('CRITICAL vulnerabilities detected')
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 13: Deploy to Kubernetes
+        // =====================================================================
+        stage('Deploy to K8s') {
+            when { expression { params.DEPLOY_TO_K8S && params.IMAGE_NAME?.trim() } }
+            steps {
+                script {
+                    def namespace = params.K8S_NAMESPACE ?: params.IMAGE_NAME
+                    def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+
+                    sh """
+                        echo "=== Deploying to Kubernetes ==="
+                        echo "  Image:     ${fullImage}"
+                        echo "  Namespace: ${namespace}"
+                        echo "  Env:       ${params.DEPLOY_ENV}"
+
+                        # Update image in deployment
+                        kubectl set image deployment/${params.IMAGE_NAME} \
+                            ${params.IMAGE_NAME}=${fullImage} \
+                            -n ${namespace} 2>/dev/null || \
+                        echo "kubectl set image failed — ensure deployment exists"
+
+                        # Wait for rollout
+                        kubectl rollout status deployment/${params.IMAGE_NAME} \
+                            -n ${namespace} --timeout=300s 2>/dev/null || \
+                        echo "Rollout status check failed"
+
+                        # Health check
+                        kubectl get pods -n ${namespace} -l app=${params.IMAGE_NAME} 2>/dev/null || true
+                    """
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Post Actions
+    // =========================================================================
+    post {
+        always {
+            archiveArtifacts artifacts: 'build-reports/**/*', allowEmptyArchive: true
+
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'build-reports',
+                reportFiles: '*.html',
+                reportName: 'Build & Test Reports'
+            ])
+
+            echo """
+            ==========================================
+              CI/CD Pipeline Complete
+            ==========================================
+              Language:  ${env.DETECTED_LANG}
+              Reports:   ${REPORTS_DIR}
+            ==========================================
+            """
+        }
+        success {
+            echo 'Pipeline PASSED'
+        }
+        unstable {
+            echo 'Pipeline completed with WARNINGS — review reports'
+        }
+        failure {
+            echo 'Pipeline FAILED — check logs and reports'
+        }
+        cleanup {
+            cleanWs(deleteDirs: true, patterns: [
+                [pattern: '.trivy-cache/**', type: 'INCLUDE'],
+                [pattern: 'node_modules/**', type: 'INCLUDE']
+            ])
+        }
+    }
+}
+
+// =============================================================================
+// Helper: Auto-detect project language from files in workspace
+// =============================================================================
+def detectLanguage() {
+    // Check for language-specific files
+    if (fileExists('requirements.txt') || fileExists('setup.py') || fileExists('pyproject.toml') || fileExists('Pipfile')) {
+        echo "Detected: Python"
+        return 'python'
+    }
+    if (fileExists('pom.xml')) {
+        echo "Detected: Java (Maven)"
+        return 'java-maven'
+    }
+    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
+        echo "Detected: Java (Gradle)"
+        return 'java-gradle'
+    }
+    if (fileExists('angular.json')) {
+        echo "Detected: Angular"
+        return 'angular'
+    }
+    if (fileExists('next.config.js') || fileExists('next.config.mjs')) {
+        echo "Detected: React (Next.js)"
+        return 'react'
+    }
+    if (fileExists('vue.config.js') || fileExists('nuxt.config.js') || fileExists('nuxt.config.ts')) {
+        echo "Detected: Vue"
+        return 'vue'
+    }
+    if (fileExists('package.json')) {
+        // Check if React
+        def pkgJson = readFile('package.json')
+        if (pkgJson.contains('"react"')) {
+            echo "Detected: React"
+            return 'react'
+        }
+        echo "Detected: Node.js"
+        return 'nodejs'
+    }
+    if (fileExists('go.mod')) {
+        echo "Detected: Go"
+        return 'go'
+    }
+    if (sh(script: 'find . -maxdepth 2 -name "*.csproj" | head -1', returnStdout: true).trim()) {
+        echo "Detected: .NET"
+        return 'dotnet'
+    }
+
+    echo "Could not auto-detect language — defaulting to 'nodejs'"
+    return 'nodejs'
+}

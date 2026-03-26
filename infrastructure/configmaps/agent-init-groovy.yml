@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jenkins-agent-init-groovy
+  namespace: jenkins
+data:
+  configure-agent.groovy: |
+    #!groovy
+    // =========================================================================
+    // configure-agent.groovy — Configure Jenkins to Accept JNLP Agents
+    // =========================================================================
+    import jenkins.model.*
+    import hudson.slaves.*
+    import hudson.model.*
+    import jenkins.slaves.*
+
+    def instance = Jenkins.getInstance()
+
+    // ---- Enable JNLP Agent Protocol ----
+    println "[INIT] Configuring JNLP agent protocols..."
+
+    // Set fixed JNLP port (50000)
+    instance.setSlaveAgentPort(50000)
+
+    // Enable JNLP4 protocol (encrypted, recommended)
+    Set<String> protocols = new HashSet<>(instance.getAgentProtocols())
+    protocols.add("JNLP4-connect")
+    // Remove old insecure protocols
+    protocols.remove("JNLP-connect")
+    protocols.remove("JNLP2-connect")
+    protocols.remove("JNLP3-connect")
+    instance.setAgentProtocols(protocols)
+
+    println "[INIT] JNLP agent port set to 50000"
+    println "[INIT] Enabled protocols: ${instance.getAgentProtocols()}"
+
+    // ---- Configure TCP Agent Listener ----
+    // Ensure the TCP port for inbound agents is open
+    def tcp = instance.getTcpSlaveAgentListener()
+    if (tcp != null) {
+        println "[INIT] TCP Agent Listener active on port: ${tcp.getPort()}"
+    }
+
+    // ---- Disable CSRF crumb for CLI if needed ----
+    // (keeps CSRF enabled for web but allows agent connections)
+    def crumbIssuer = instance.getCrumbIssuer()
+    if (crumbIssuer != null) {
+        println "[INIT] CSRF Crumb Issuer is active: ${crumbIssuer.getClass().getName()}"
+    }
+
+    instance.save()
+    println "[INIT] Jenkins agent configuration complete."

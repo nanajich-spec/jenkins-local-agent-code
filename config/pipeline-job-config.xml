@@ -1,0 +1,129 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<flow-definition plugin="workflow-job">
+  <actions/>
+  <description>End-to-End Security Scanning Pipeline — Trivy, Grype, K8s Config Audit</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.model.StringParameterDefinition>
+          <name>IMAGE_NAME</name>
+          <defaultValue>catool</defaultValue>
+          <description>Image name to scan</description>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>IMAGE_TAG</name>
+          <defaultValue>latest</defaultValue>
+          <description>Image tag</description>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.ChoiceParameterDefinition>
+          <name>SCAN_TYPE</name>
+          <choices class="java.util.Arrays$ArrayList">
+            <a class="string-array">
+              <string>full</string>
+              <string>image-only</string>
+              <string>code-only</string>
+              <string>k8s-manifests</string>
+            </a>
+          </choices>
+          <description>Type of security scan</description>
+        </hudson.model.ChoiceParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>FAIL_ON_CRITICAL</name>
+          <defaultValue>true</defaultValue>
+          <description>Fail build on CRITICAL vulnerabilities</description>
+        </hudson.model.BooleanParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>SCAN_REGISTRY_IMAGES</name>
+          <defaultValue>false</defaultValue>
+          <description>Scan all images in local registry</description>
+        </hudson.model.BooleanParameterDefinition>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+  </properties>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps">
+    <script><![CDATA[pipeline {
+    agent { label 'local-security-agent' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+    environment {
+        REGISTRY = '132.186.17.22:5000'
+        SCAN_SEVERITY = 'CRITICAL,HIGH'
+    }
+    stages {
+        stage('Setup') {
+            steps {
+                sh 'mkdir -p security-reports'
+                sh 'echo "=== Tools ===" && java -version 2>&1 | head -1 && trivy --version 2>&1 | head -1 && podman --version 2>&1'
+            }
+        }
+        stage('Secret Detection') {
+            when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
+            steps {
+                sh 'trivy fs --scanners secret --format json --output security-reports/secret-scan.json . || true'
+                sh 'trivy fs --scanners secret --format table . || true'
+            }
+        }
+        stage('SAST Scan') {
+            when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
+            steps {
+                sh 'trivy fs --scanners vuln,misconfig --severity CRITICAL,HIGH --format json --output security-reports/trivy-fs.json . || true'
+                sh 'trivy fs --scanners vuln,misconfig --severity CRITICAL,HIGH --format table . || true'
+            }
+        }
+        stage('Image Scan') {
+            when { expression { params.SCAN_TYPE in ['full', 'image-only'] } }
+            steps {
+                script {
+                    def img = "132.186.17.22:5000/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                    sh "trivy image --podman-host '' --severity CRITICAL,HIGH --format json --output security-reports/trivy-image.json '${img}' || true"
+                    sh "trivy image --podman-host '' --severity CRITICAL,HIGH --format table '${img}' || true"
+                }
+            }
+        }
+        stage('K8s Manifest Scan') {
+            when { expression { params.SCAN_TYPE in ['full', 'k8s-manifests'] } }
+            steps {
+                sh 'trivy config --severity CRITICAL,HIGH --format json --output security-reports/trivy-k8s.json /root/Downloads/cat-deployments || true'
+                sh 'trivy config --severity CRITICAL,HIGH --format table /root/Downloads/cat-deployments || true'
+            }
+        }
+        stage('Registry Scan') {
+            when { expression { return params.SCAN_REGISTRY_IMAGES } }
+            steps {
+                sh 'bash /root/Downloads/cat-deployments/jenkins/security-pipeline/scripts/scan-all-images.sh || true'
+            }
+        }
+        stage('Security Gate') {
+            steps {
+                script {
+                    echo '=== Security Gate ==='
+                    def rc = sh(script: '''
+                        CRIT=0
+                        if [ -f "security-reports/trivy-image.json" ]; then
+                            CRIT=$(python3 -c "import json; d=json.load(open('security-reports/trivy-image.json')); print(sum(1 for r in d.get('Results',[]) for v in r.get('Vulnerabilities',[]) if v.get('Severity')=='CRITICAL'))" 2>/dev/null || echo 0)
+                        fi
+                        echo "CRITICAL: $CRIT"
+                        [ "$CRIT" -gt 0 ] && exit 1 || exit 0
+                    ''', returnStatus: true)
+                    if (rc != 0 && params.FAIL_ON_CRITICAL) {
+                        unstable('CRITICAL vulnerabilities detected')
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'security-reports/**', allowEmptyArchive: true
+            echo 'Security scan complete.'
+        }
+    }
+}]]></script>
+    <sandbox>true</sandbox>
+  </definition>
+  <triggers/>
+  <disabled>false</disabled>
+</flow-definition>

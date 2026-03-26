@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonarqube-postgres
+  namespace: sonarqube
+  labels:
+    app: sonarqube-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sonarqube-postgres
+  template:
+    metadata:
+      labels:
+        app: sonarqube-postgres
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: inblrmanappph02
+      tolerations:
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: sonarqube-postgres-secrets
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - sonarqube
+                - -d
+                - sonarqube
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - sonarqube
+                - -d
+                - sonarqube
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: sonarqube-postgres-pvc

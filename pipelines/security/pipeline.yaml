@@ -1,0 +1,147 @@
+# =============================================================================
+# .pipeline.yaml — Security Pipeline Configuration
+# =============================================================================
+# Central configuration for the Jenkins security scanning pipeline.
+# Referenced by the Jenkinsfile and CLI agent scripts.
+# =============================================================================
+
+pipeline:
+  name: security-scan-pipeline
+  description: "End-to-End Security Scanning Pipeline for CAT Deployments"
+
+# =============================================================================
+# Jenkins Connection
+# =============================================================================
+jenkins:
+  url: "http://132.186.17.25:32000"
+  credentials:
+    user: admin
+    # password should be set via JENKINS_PASS env var, not stored here
+
+# =============================================================================
+# Agent Configuration
+# =============================================================================
+agent:
+  name: "local-security-agent"
+  labels: "local-security-agent linux security trivy podman"
+  workdir: "/opt/jenkins-agent"
+  executors: 2
+  jnlp_port: 31572
+  node: "inblrmanappph06"
+  ip: "132.186.17.22"
+
+# =============================================================================
+# Container Registry
+# =============================================================================
+registry:
+  url: "132.186.17.22:5000"
+  scheme: "http"
+  insecure: true
+
+# =============================================================================
+# Scan Targets — Images to scan
+# =============================================================================
+scan_targets:
+  images:
+    - name: catool
+      tag: "latest"
+    - name: catool-ns
+      tag: "1.0.0_beta_hotfix"
+    - name: catool-ui
+      tag: "latest"
+    - name: catool-mq
+      tag: "latest"
+    - name: catool-worker
+      tag: "latest"
+    - name: catool-postgres
+      tag: "latest"
+
+  manifests:
+    - path: "cat-deployments/catool/"
+    - path: "cat-deployments/catool-ns/"
+    - path: "cat-deployments/catool-ui/"
+    - path: "cat-deployments/jenkins/"
+
+# =============================================================================
+# Security Scan Configuration
+# =============================================================================
+scans:
+  # Vulnerability severity levels to flag
+  severity: "CRITICAL,HIGH"
+
+  # Fail the build if CRITICAL vulnerabilities are found
+  fail_on_critical: true
+
+  # Secret detection
+  secrets:
+    enabled: true
+    patterns:
+      - "password"
+      - "secret"
+      - "token"
+      - "api_key"
+      - "private_key"
+
+  # SAST — Static Application Security Testing
+  sast:
+    trivy_fs: true
+    hadolint: true
+    shellcheck: true
+
+  # SCA — Software Composition Analysis
+  sca:
+    trivy: true
+    grype: true
+    owasp_dependency_check: true
+
+  # Container Image Scanning
+  container:
+    trivy: true
+    grype: true
+    scan_all_registry: false
+
+  # Kubernetes Security
+  kubernetes:
+    config_scan: true
+    kubesec: true
+    cluster_audit: false    # requires kubeconfig access
+
+  # SonarQube (optional — set to false if not available)
+  sonarqube:
+    enabled: true
+    host_url: "http://sonarqube.sonarqube.svc.cluster.local:9000"
+    project_key: "catool-project"
+    quality_gate: true
+
+# =============================================================================
+# Thresholds & Quality Gates
+# =============================================================================
+thresholds:
+  max_critical: 0          # Fail if more than N critical vulns
+  max_high: 10             # Warn if more than N high vulns
+  max_medium: 50           # Info only
+  coverage_minimum: 70     # Minimum code coverage %
+
+# =============================================================================
+# Reports
+# =============================================================================
+reports:
+  output_dir: "security-reports"
+  formats:
+    - json
+    - table
+    - html
+  archive: true
+  publish_html: true
+
+# =============================================================================
+# Notifications (optional)
+# =============================================================================
+notifications:
+  slack:
+    enabled: false
+    channel: "#security-alerts"
+    webhook_credential: "slack-webhook"
+  email:
+    enabled: false
+    recipients: "team@example.com"
