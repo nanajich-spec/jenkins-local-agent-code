@@ -20,6 +20,46 @@ curl -sL http://132.186.17.22:9091/scan | bash
 
 **You do NOT need:** Java, Docker, Podman, Trivy, Python, Jenkins, or any other tool.
 
+### Windows Users
+
+The scan script requires `bash`. On Windows, use one of these options:
+
+**Option 1 — WSL (Recommended)**
+```powershell
+# Open WSL terminal, then run:
+wsl curl -sL http://132.186.17.22:9091/scan | bash
+```
+
+**Option 2 — Git Bash**
+```bash
+# Open Git Bash (installed with Git for Windows), then run:
+curl -sL http://132.186.17.22:9091/scan | bash
+```
+
+**Option 3 — Download and run in WSL**
+```powershell
+# From PowerShell: download the script, then run it in WSL
+curl -sL http://132.186.17.22:9091/scan -o scan.sh
+wsl bash scan.sh
+```
+
+**If WSL gives errors** (e.g., `execvpe(/bin/bash) failed: No such file or directory`):
+```powershell
+# 1. Check WSL is installed and a distro is registered
+wsl --list --verbose
+
+# 2. If no distro listed, install Ubuntu
+wsl --install -d Ubuntu
+
+# 3. If distro exists but broken, restart WSL
+wsl --shutdown
+wsl
+
+# 4. If still failing, re-register the distro
+wsl --unregister Ubuntu
+wsl --install -d Ubuntu
+```
+
 ---
 
 ### How It Works
@@ -243,3 +283,6 @@ Or share the landing page URL: `http://132.186.17.22:9091/`
 | "No artifacts found" | Agent may be offline. Run: `curl ... \| bash -s -- --status` |
 | Slow scan | First run downloads vulnerability DBs. Subsequent runs are faster |
 | Port blocked | Ensure firewall allows 9091, 32000, 5000 |
+| WSL `execvpe(/bin/bash) failed` | WSL distro is broken. Run: `wsl --shutdown` then `wsl --install -d Ubuntu`. Or use **Git Bash** instead |
+| WSL "No such file or directory" | No WSL distro installed. Run: `wsl --install -d Ubuntu` from PowerShell (admin) |
+| Windows: `bash` not found | Install Git for Windows (includes Git Bash) or WSL. See **Windows Users** section above |
