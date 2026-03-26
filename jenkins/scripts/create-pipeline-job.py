@@ -2,13 +2,14 @@
 """Create the security-scan-pipeline job in Jenkins via REST API."""
 
 import json
+import os
 import urllib.request
 import urllib.parse
 import http.cookiejar
 import base64
 import sys
 
-jenkins_url = "http://132.186.17.25:32000"
+jenkins_url = "http://132.186.17.22:32000"
 user, password = "admin", "admin"
 
 cj = http.cookiejar.CookieJar()
@@ -23,7 +24,8 @@ crumb_data = json.loads(resp.read().decode())
 headers[crumb_data["crumbRequestField"]] = crumb_data["crumb"]
 
 # Read job config XML from file
-config_path = "/root/Downloads/cat-deployments/jenkins/security-pipeline/config/pipeline-job-config.xml"
+script_dir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(script_dir, "..", "config", "pipeline-job-config.xml")
 with open(config_path, "r") as f:
     job_config = f.read()
 

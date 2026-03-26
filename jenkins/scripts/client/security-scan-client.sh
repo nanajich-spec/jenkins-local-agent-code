@@ -47,6 +47,7 @@ JENKINS_USER="${JENKINS_USER:-admin}"
 JENKINS_TOKEN="${JENKINS_TOKEN:-admin}"
 JOB_NAME="${JOB_NAME:-security-scan-pipeline}"
 REGISTRY="${REGISTRY:-132.186.17.22:5000}"
+UPLOAD_SERVER="${UPLOAD_SERVER:-http://132.186.17.22:9091}"
 
 # =============================================================================
 # User-specific isolation
@@ -56,9 +57,9 @@ HOST_ID="$(hostname -s 2>/dev/null || echo 'unknown')"
 SCAN_ID="${USER_ID}-${HOST_ID}-$(date +%s)"
 
 # Defaults
-IMAGE_NAME="catool"
+IMAGE_NAME=""
 IMAGE_TAG="latest"
-SCAN_TYPE="full"
+SCAN_TYPE=""
 FAIL_ON_CRITICAL="true"
 SCAN_REGISTRY="false"
 GIT_REPO=""
@@ -67,6 +68,7 @@ OUTPUT_DIR="./security-reports-$(date +%Y%m%d_%H%M%S)"
 OPEN_REPORT="true"
 QUIET="false"
 FORMAT="table"
+SOURCE_UPLOAD_PATH=""
 
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -84,10 +86,18 @@ usage() {
 
   Usage: bash security-scan-client.sh [OPTIONS]
 
+  DEFAULT BEHAVIOR:
+    Running without --image scans the SOURCE CODE in your current directory.
+    Your code is uploaded to the central server, scanned, then cleaned up.
+
   Scan Options:
-    --image NAME         Image to scan in registry (default: catool)
+    --image NAME         Scan a Docker image from the registry (image-only scan)
     --tag TAG            Image tag (default: latest)
     --type TYPE          Scan type: full | image-only | code-only | k8s-manifests
+                           full         = source code + image (requires --image)
+                           code-only    = source code only (default)
+                           image-only   = Docker image only (requires --image)
+                           k8s-manifests = scan YAML/YML files for K8s issues
     --scan-registry      Scan ALL images in the registry
     --no-fail-critical   Don't fail on CRITICAL vulnerabilities
     --repo URL           Git repo URL to scan (optional)
@@ -106,11 +116,11 @@ usage() {
     --token TOKEN        Jenkins API token
 
   Examples:
-    bash security-scan-client.sh                              # Full scan of default image
-    bash security-scan-client.sh --image catool-ns --tag 1.0  # Scan specific image
-    bash security-scan-client.sh --type image-only            # Only container scan
-    bash security-scan-client.sh --scan-registry              # Scan everything
-    bash security-scan-client.sh --type k8s-manifests         # K8s config audit
+    bash security-scan-client.sh                              # Scan current dir source code
+    bash security-scan-client.sh --image catool --tag 1.0     # Scan Docker image only
+    bash security-scan-client.sh --image catool --type full   # Scan source code + image
+    bash security-scan-client.sh --type k8s-manifests         # K8s config audit on current dir
+    bash security-scan-client.sh --scan-registry              # Scan all registry images
 
   List available images:
     bash security-scan-client.sh --list-images
@@ -180,6 +190,10 @@ json_bool() {
     fi
 }
 
+# Cookie jar for session-bound CSRF crumbs
+COOKIE_JAR=$(mktemp -t jenkins-cookies.XXXXXX 2>/dev/null || mktemp)
+trap 'rm -f "${COOKIE_JAR}"' EXIT
+
 # Jenkins API helpers
 jenkins_get() {
     curl -s -u "${JENKINS_USER}:${JENKINS_TOKEN}" "$@"
@@ -187,9 +201,10 @@ jenkins_get() {
 
 jenkins_post() {
     local url="$1"; shift
-    # Get CSRF crumb
+    # Get CSRF crumb with session cookie (crumb is session-bound)
     local crumb_json crumb_hdr crumb_val
     crumb_json=$(curl -s -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+        -c "${COOKIE_JAR}" \
         "${JENKINS_URL}/crumbIssuer/api/json" 2>/dev/null || echo "")
     crumb_hdr=$(json_val "${crumb_json}" "crumbRequestField" 2>/dev/null || echo "Jenkins-Crumb")
     crumb_val=$(json_val "${crumb_json}" "crumb" 2>/dev/null || echo "none")
@@ -197,6 +212,7 @@ jenkins_post() {
     [ -z "${crumb_val}" ] && crumb_val="none"
 
     curl -s -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+        -b "${COOKIE_JAR}" \
         -H "${crumb_hdr}:${crumb_val}" \
         -X POST "$@" "${url}"
 }
@@ -204,7 +220,9 @@ jenkins_post() {
 jenkins_post_code() {
     local url="$1"; shift
     local crumb_json crumb_hdr crumb_val
+    # Get CSRF crumb with session cookie (crumb is session-bound)
     crumb_json=$(curl -s -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+        -c "${COOKIE_JAR}" \
         "${JENKINS_URL}/crumbIssuer/api/json" 2>/dev/null || echo "")
     crumb_hdr=$(json_val "${crumb_json}" "crumbRequestField" 2>/dev/null || echo "Jenkins-Crumb")
     crumb_val=$(json_val "${crumb_json}" "crumb" 2>/dev/null || echo "none")
@@ -212,6 +230,7 @@ jenkins_post_code() {
     [ -z "${crumb_val}" ] && crumb_val="none"
 
     curl -s -o /dev/null -w "%{http_code}" -u "${JENKINS_USER}:${JENKINS_TOKEN}" \
+        -b "${COOKIE_JAR}" \
         -H "${crumb_hdr}:${crumb_val}" \
         -X POST "$@" "${url}"
 }
@@ -414,14 +433,137 @@ except Exception as e:
 }
 
 # =============================================================================
+# Upload source code to central server
+# =============================================================================
+upload_source() {
+    step "Packaging source code from current directory..."
+
+    local src_dir
+    src_dir="$(pwd)"
+    local tar_file
+    tar_file=$(mktemp /tmp/scan-source-XXXXXX.tar.gz)
+
+    # Count files (excluding common large/irrelevant dirs)
+    local file_count
+    file_count=$(find "${src_dir}" -maxdepth 5 -type f \
+        ! -path '*/.git/*' ! -path '*/node_modules/*' ! -path '*/__pycache__/*' \
+        ! -path '*/venv/*' ! -path '*/.venv/*' ! -path '*/dist/*' ! -path '*/build/*' \
+        ! -path '*/.idea/*' ! -path '*/.vscode/*' ! -path '*/target/*' \
+        ! -path '*/.gradle/*' ! -path '*/.m2/*' \
+        2>/dev/null | wc -l)
+
+    echo -e "  ${BOLD}Directory:${NC} ${src_dir}"
+    echo -e "  ${BOLD}Files:${NC}     ${file_count} (excluding .git, node_modules, etc.)"
+
+    if [ "${file_count}" -eq 0 ]; then
+        warn "No source files found in ${src_dir}"
+        warn "Make sure you run this from your project directory"
+        exit 1
+    fi
+
+    # Create tar.gz excluding common large directories and binary artifacts
+    tar czf "${tar_file}" \
+        --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
+        --exclude='venv' --exclude='.venv' --exclude='dist' --exclude='build' \
+        --exclude='.idea' --exclude='.vscode' --exclude='target' \
+        --exclude='.gradle' --exclude='.m2' --exclude='.tox' \
+        --exclude='*.pyc' --exclude='*.class' --exclude='*.o' --exclude='*.so' \
+        --exclude='*.jar' --exclude='*.war' --exclude='*.ear' \
+        --exclude='*.exe' --exclude='*.dll' --exclude='*.dylib' \
+        --exclude='*.zip' --exclude='*.tar' --exclude='*.tar.gz' --exclude='*.tgz' \
+        --exclude='*.rar' --exclude='*.7z' \
+        --exclude='*.iso' --exclude='*.img' --exclude='*.bin' \
+        --exclude='.cache' --exclude='.npm' --exclude='.yarn' \
+        --exclude='vendor' --exclude='coverage' --exclude='.coverage' \
+        --exclude='*.log' --exclude='*.sqlite3' --exclude='*.db' \
+        --exclude='security-reports-*' \
+        -C "${src_dir}" . 2>/dev/null || true
+
+    local tar_size
+    tar_size=$(du -sh "${tar_file}" 2>/dev/null | cut -f1)
+    echo -e "  ${BOLD}Archive:${NC}   ${tar_size}"
+
+    # Upload to central server
+    step "Uploading source code to scan server..."
+    local upload_response
+    upload_response=$(curl -s --connect-timeout 30 --max-time 300 \
+        -X POST "${UPLOAD_SERVER}/upload" \
+        -H "Content-Type: application/octet-stream" \
+        -H "X-Scan-ID: ${SCAN_ID}" \
+        --data-binary "@${tar_file}" 2>/dev/null || echo '{"error":"upload failed"}')
+
+    rm -f "${tar_file}"
+
+    # Parse response
+    local upload_status upload_path
+    upload_status=$(json_val "${upload_response}" "status" 2>/dev/null || echo "")
+    upload_path=$(json_val "${upload_response}" "upload_path" 2>/dev/null || echo "")
+
+    if [ "${upload_status}" = "ok" ] && [ -n "${upload_path}" ]; then
+        SOURCE_UPLOAD_PATH="${upload_path}"
+        info "Source code uploaded (${tar_size})"
+    else
+        local upload_err
+        upload_err=$(json_val "${upload_response}" "error" 2>/dev/null || echo "unknown error")
+        err "Failed to upload source code: ${upload_err}"
+        err "Response: ${upload_response}"
+        exit 1
+    fi
+}
+
+# =============================================================================
 # Trigger the scan
 # =============================================================================
 trigger_scan() {
+    # ── Determine scan mode ──
+    # If --image is set → image scan; if no --image → source code scan
+    local do_code_scan="false"
+    local do_image_scan="false"
+
+    if [ -n "${IMAGE_NAME}" ]; then
+        # User specified --image
+        if [ -z "${SCAN_TYPE}" ]; then
+            SCAN_TYPE="image-only"
+        fi
+        case "${SCAN_TYPE}" in
+            full)          do_code_scan="true";  do_image_scan="true" ;;
+            image-only)    do_code_scan="false"; do_image_scan="true" ;;
+            code-only)     do_code_scan="true";  do_image_scan="false" ;;
+            k8s-manifests) do_code_scan="false"; do_image_scan="false" ;;
+        esac
+    else
+        # No --image → scan current directory source code
+        if [ -z "${SCAN_TYPE}" ]; then
+            SCAN_TYPE="code-only"
+        fi
+        IMAGE_NAME="none"
+        case "${SCAN_TYPE}" in
+            full)          do_code_scan="true"; do_image_scan="false" ;;
+            code-only)     do_code_scan="true"; do_image_scan="false" ;;
+            k8s-manifests) do_code_scan="true"; do_image_scan="false" ;;
+            image-only)
+                err "Cannot use --type image-only without --image"
+                err "Usage: bash security-scan-client.sh --image <name> --type image-only"
+                exit 1
+                ;;
+        esac
+    fi
+
+    # ── Upload source code if needed ──
+    if [ "${do_code_scan}" = "true" ] || [ "${SCAN_TYPE}" = "k8s-manifests" ]; then
+        upload_source
+    fi
+
     step "Triggering security scan..."
     echo ""
     echo -e "  ${BOLD}Scan ID:${NC}    ${SCAN_ID}"
     echo -e "  ${BOLD}User:${NC}       ${USER_ID}@${HOST_ID}"
-    echo -e "  ${BOLD}Image:${NC}      ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    if [ "${do_image_scan}" = "true" ]; then
+        echo -e "  ${BOLD}Image:${NC}      ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    fi
+    if [ "${do_code_scan}" = "true" ] || [ "${SCAN_TYPE}" = "k8s-manifests" ]; then
+        echo -e "  ${BOLD}Source:${NC}     $(pwd) (uploaded)"
+    fi
     echo -e "  ${BOLD}Scan type:${NC}  ${SCAN_TYPE}"
     [ -n "${GIT_REPO}" ] && echo -e "  ${BOLD}Git Repo:${NC}   ${GIT_REPO} (${GIT_BRANCH})"
     echo ""
@@ -433,7 +575,9 @@ trigger_scan() {
         --data-urlencode "REGISTRY_URL=${REGISTRY}" \
         --data-urlencode "SCAN_TYPE=${SCAN_TYPE}" \
         --data-urlencode "FAIL_ON_CRITICAL=${FAIL_ON_CRITICAL}" \
-        --data-urlencode "SCAN_REGISTRY_IMAGES=${SCAN_REGISTRY}")
+        --data-urlencode "SCAN_REGISTRY_IMAGES=${SCAN_REGISTRY}" \
+        --data-urlencode "SOURCE_UPLOAD_PATH=${SOURCE_UPLOAD_PATH}" \
+        --data-urlencode "SCAN_ID=${SCAN_ID}")
 
     if [ "${trigger_code}" = "201" ] || [ "${trigger_code}" = "302" ]; then
         info "Scan triggered successfully"
@@ -453,14 +597,50 @@ trigger_scan() {
 wait_and_download() {
     step "Waiting for scan to start..."
 
-    # Get build number
+    # Find the build matching our SCAN_ID (avoids race conditions with other scans)
     sleep 4
     local build_num="" retries=0
-    while [ -z "${build_num}" ] && [ ${retries} -lt 20 ]; do
-        build_num=$(jenkins_get "${JENKINS_URL}/job/${JOB_NAME}/lastBuild/buildNumber" 2>/dev/null || echo "")
+    while [ -z "${build_num}" ] && [ ${retries} -lt 30 ]; do
+        # Get the last few build numbers and find ours by SCAN_ID
+        local last_build
+        last_build=$(jenkins_get "${JENKINS_URL}/job/${JOB_NAME}/lastBuild/buildNumber" 2>/dev/null || echo "")
+        if [ -n "${last_build}" ]; then
+            # Check last 3 builds for our SCAN_ID
+            for check_num in ${last_build} $((last_build - 1)) $((last_build + 1)); do
+                [ "${check_num}" -lt 1 ] 2>/dev/null && continue
+                local build_json
+                build_json=$(jenkins_get "${JENKINS_URL}/job/${JOB_NAME}/${check_num}/api/json" 2>/dev/null || echo "")
+                if [ -n "${build_json}" ]; then
+                    local found_id
+                    if command -v python3 &>/dev/null; then
+                        found_id=$(echo "${build_json}" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for a in d.get('actions', []):
+        for p in a.get('parameters', []):
+            if p.get('name') == 'SCAN_ID' and p.get('value') == '${SCAN_ID}':
+                print(p['value'])
+except: pass
+" 2>/dev/null || echo "")
+                    else
+                        found_id=$(echo "${build_json}" | grep -o "\"value\":\"${SCAN_ID}\"" 2>/dev/null | head -1)
+                    fi
+                    if [ -n "${found_id}" ]; then
+                        build_num="${check_num}"
+                        break
+                    fi
+                fi
+            done
+        fi
         retries=$((retries + 1))
-        [ -z "${build_num}" ] && sleep 2
+        [ -z "${build_num}" ] && sleep 3
     done
+
+    # Fallback to lastBuild if we can't find our specific build
+    if [ -z "${build_num}" ]; then
+        build_num=$(jenkins_get "${JENKINS_URL}/job/${JOB_NAME}/lastBuild/buildNumber" 2>/dev/null || echo "")
+    fi
 
     if [ -z "${build_num}" ]; then
         err "Could not get build number. The scan may still be queued."

@@ -2,13 +2,13 @@
 
 ## For Users (Zero Setup)
 
-You don't need to install anything. Just run ONE command:
+You don't need to install anything. Just run ONE command from your project directory:
 
 ```bash
 curl -sL http://132.186.17.22:9091/scan | bash
 ```
 
-**That's it.** The scan runs on the central server and reports download to your machine.
+**That's it.** Your source code is uploaded to the central server, scanned, then cleaned up. Reports download to your machine.
 
 ### Requirements
 
@@ -22,19 +22,31 @@ curl -sL http://132.186.17.22:9091/scan | bash
 
 ---
 
+### How It Works
+
+- **Default (no flags):** Scans the **source code** in your current directory (uploads it to the server)
+- **With `--image`:** Scans a **Docker image** from the container registry
+- **With `--type full` + `--image`:** Scans **both** source code and Docker image
+
 ### Common Commands
 
 ```bash
-# Full security scan (default image: catool:latest)
+# Scan source code in current directory (default — just cd to your project and run)
 curl -sL http://132.186.17.22:9091/scan | bash
 
-# Scan a specific image
+# Scan a specific Docker image from the registry
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --tag latest
+
+# Scan a specific image version
 curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool-ns --tag 1.0.0
 
+# Full scan: source code + Docker image
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --type full
+
 # Scan type options
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --type image-only       # Container scan only
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --type code-only        # Code/dependency scan
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --type k8s-manifests    # Kubernetes audit
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --type code-only        # Source code scan (default)
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --type image-only  # Docker image only
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --type k8s-manifests    # Kubernetes YAML audit
 
 # Scan ALL images in registry
 curl -sL http://132.186.17.22:9091/scan | bash -s -- --scan-registry
@@ -70,22 +82,47 @@ bash scan.sh --list-images
 
 ### What Happens When You Run It
 
+**Source Code Scan (default):**
 ```
 Your Machine                          Central Server (132.186.17.22)
 ─────────────                         ──────────────────────────────
-                                      
+
 1. curl downloads client script ───►  HTTP server (port 9091)
-                                      
+
+2. Script packages your source  
+   code (tar.gz, excludes .git,       
+   node_modules, binaries)
+
+3. Uploads tar.gz to server    ───►  HTTP server receives & stores
+
+4. Script triggers scan via API ───►  Jenkins (port 32000)
+                                          │
+5. Console output streams back  ◄───  Jenkins extracts your code,
+                                      │ runs Trivy, Grype, ShellCheck
+                                      │ SAST, SCA, secret detection
+                                          │
+6. Reports download to your     ◄───  Pipeline generates reports
+   local ./security-reports-*/            (HTML, JSON, TXT)
+
+7. Uploaded code auto-deleted          Scan complete, results archived
+```
+
+**Docker Image Scan (`--image`):**
+```
+Your Machine                          Central Server (132.186.17.22)
+─────────────                         ──────────────────────────────
+
+1. curl downloads client script ───►  HTTP server (port 9091)
+
 2. Script triggers scan via API ───►  Jenkins (port 32000)
                                           │
-3. Console output streams back  ◄───  Jenkins runs pipeline on agent
-                                          │ Trivy, Grype, Hadolint,
-                                          │ ShellCheck, Kubesec, OWASP
+3. Console output streams back  ◄───  Jenkins pulls image from
+                                      │ registry, runs Trivy scan
                                           │
 4. Reports download to your     ◄───  Pipeline generates reports
-   local ./security-reports-*/            (HTML, JSON, TXT)
-                                      
-5. HTML report opens in browser        Scan complete, results archived
+   local ./security-reports-*/
+
+5. HTML report opens in browser        Scan complete
 ```
 
 ### Report Files You Get

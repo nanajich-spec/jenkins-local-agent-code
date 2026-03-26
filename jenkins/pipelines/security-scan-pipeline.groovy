@@ -1,72 +1,12 @@
-<?xml version='1.1' encoding='UTF-8'?>
-<flow-definition plugin="workflow-job">
-  <actions/>
-  <description>End-to-End Security Scanning Pipeline — Trivy, Grype, K8s Config Audit</description>
-  <keepDependencies>false</keepDependencies>
-  <properties>
-    <hudson.model.ParametersDefinitionProperty>
-      <parameterDefinitions>
-        <hudson.model.StringParameterDefinition>
-          <name>IMAGE_NAME</name>
-          <defaultValue>catool</defaultValue>
-          <description>Image name to scan</description>
-        </hudson.model.StringParameterDefinition>
-        <hudson.model.StringParameterDefinition>
-          <name>IMAGE_TAG</name>
-          <defaultValue>latest</defaultValue>
-          <description>Image tag</description>
-        </hudson.model.StringParameterDefinition>
-        <hudson.model.ChoiceParameterDefinition>
-          <name>SCAN_TYPE</name>
-          <choices class="java.util.Arrays$ArrayList">
-            <a class="string-array">
-              <string>full</string>
-              <string>image-only</string>
-              <string>code-only</string>
-              <string>k8s-manifests</string>
-            </a>
-          </choices>
-          <description>Type of security scan</description>
-        </hudson.model.ChoiceParameterDefinition>
-        <hudson.model.BooleanParameterDefinition>
-          <name>FAIL_ON_CRITICAL</name>
-          <defaultValue>true</defaultValue>
-          <description>Fail build on CRITICAL vulnerabilities</description>
-        </hudson.model.BooleanParameterDefinition>
-        <hudson.model.BooleanParameterDefinition>
-          <name>SCAN_REGISTRY_IMAGES</name>
-          <defaultValue>false</defaultValue>
-          <description>Scan all images in local registry</description>
-        </hudson.model.BooleanParameterDefinition>
-        <hudson.model.StringParameterDefinition>
-          <name>SOURCE_UPLOAD_PATH</name>
-          <defaultValue></defaultValue>
-          <description>Path to uploaded source code tar.gz (set by client)</description>
-        </hudson.model.StringParameterDefinition>
-        <hudson.model.StringParameterDefinition>
-          <name>SCAN_ID</name>
-          <defaultValue></defaultValue>
-          <description>Unique scan ID for this run (set by client)</description>
-        </hudson.model.StringParameterDefinition>
-        <hudson.model.StringParameterDefinition>
-          <name>REGISTRY_URL</name>
-          <defaultValue>132.186.17.22:5000</defaultValue>
-          <description>Container registry URL</description>
-        </hudson.model.StringParameterDefinition>
-      </parameterDefinitions>
-    </hudson.model.ParametersDefinitionProperty>
-  </properties>
-  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps">
-    <script><![CDATA[pipeline {
+pipeline {
     agent { label 'local-security-agent' }
     options {
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timeout(time: 60, unit: 'MINUTES')
     }
     environment {
-        REGISTRY = "${params.REGISTRY_URL ?: '132.186.17.22:5000'}"
+        REGISTRY = '132.186.17.22:5000'
         SCAN_SEVERITY = 'CRITICAL,HIGH'
-        SOURCE_DIR = ''
     }
     stages {
         stage('Setup') {
@@ -75,74 +15,80 @@
                     sh 'mkdir -p security-reports'
                     sh 'echo "=== Tools ===" && trivy --version 2>&1 | head -1'
 
-                    // Determine source directory
+                    // Use REGISTRY_URL param if provided
+                    if (params.REGISTRY_URL?.trim()) {
+                        env.REGISTRY = params.REGISTRY_URL.trim()
+                    }
+
+                    // Extract uploaded source code if provided
                     if (params.SOURCE_UPLOAD_PATH?.trim()) {
                         def uploadPath = params.SOURCE_UPLOAD_PATH.trim()
-                        def tarFile = "${uploadPath}/source.tar.gz"
-                        def srcDir = "${WORKSPACE}/user-source"
+                        def tarFile = uploadPath + '/source.tar.gz'
+                        env.SOURCE_DIR = env.WORKSPACE + '/user-source'
+                        sh "mkdir -p '${env.SOURCE_DIR}'"
                         sh """
-                            mkdir -p '${srcDir}'
                             if [ -f '${tarFile}' ]; then
-                                tar xzf '${tarFile}' -C '${srcDir}' 2>/dev/null || true
-                                echo "=== Source code extracted ==="
-                                echo "Files: \$(find '${srcDir}' -type f | wc -l)"
-                                echo "Size:  \$(du -sh '${srcDir}' | cut -f1)"
+                                tar xzf '${tarFile}' -C '${env.SOURCE_DIR}' 2>/dev/null || true
+                                echo '=== Source code extracted ==='
+                                echo "Files: \$(find '${env.SOURCE_DIR}' -type f | wc -l)"
+                                echo "Size:  \$(du -sh '${env.SOURCE_DIR}' | cut -f1)"
                             else
                                 echo "WARNING: Source tar not found at ${tarFile}"
                             fi
                         """
-                        env.SOURCE_DIR = srcDir
                     } else {
-                        env.SOURCE_DIR = WORKSPACE
+                        env.SOURCE_DIR = env.WORKSPACE
                     }
 
-                    echo """
-                    ==========================================
-                      Security Scan Pipeline
-                    ==========================================
-                      Scan Type:   ${params.SCAN_TYPE}
-                      Scan ID:     ${params.SCAN_ID ?: 'N/A'}
-                      Image:       ${env.REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}
-                      Source Dir:  ${env.SOURCE_DIR}
-                      Source Upload: ${params.SOURCE_UPLOAD_PATH ? 'YES (user code)' : 'NO'}
-                    ==========================================
-                    """
+                    echo "=========================================="
+                    echo "  Security Scan Pipeline"
+                    echo "=========================================="
+                    echo "  Scan Type:     ${params.SCAN_TYPE}"
+                    echo "  Scan ID:       ${params.SCAN_ID ?: 'N/A'}"
+                    echo "  Image:         ${env.REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                    echo "  Source Dir:    ${env.SOURCE_DIR}"
+                    echo "  Source Upload: ${params.SOURCE_UPLOAD_PATH ? 'YES (user code)' : 'NO'}"
+                    echo "=========================================="
                 }
             }
         }
+
         stage('Secret Detection') {
             when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
             steps {
                 script {
-                    def scanDir = env.SOURCE_DIR ?: WORKSPACE
+                    def scanDir = env.SOURCE_DIR
                     sh "echo '=== Scanning for secrets in: ${scanDir} ==='"
                     sh "trivy fs --scanners secret --format json --output security-reports/secret-scan.json '${scanDir}' || true"
                     sh "trivy fs --scanners secret --format table '${scanDir}' || true"
                 }
             }
         }
+
         stage('SAST / Vulnerability Scan') {
             when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
             steps {
                 script {
-                    def scanDir = env.SOURCE_DIR ?: WORKSPACE
+                    def scanDir = env.SOURCE_DIR
                     sh "echo '=== SAST scan on: ${scanDir} ==='"
                     sh "trivy fs --scanners vuln,misconfig --severity CRITICAL,HIGH --format json --output security-reports/trivy-fs-scan.json '${scanDir}' || true"
                     sh "trivy fs --scanners vuln,misconfig --severity CRITICAL,HIGH --format table '${scanDir}' || true"
                 }
             }
         }
+
         stage('SCA / Dependency Scan') {
             when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
             steps {
                 script {
-                    def scanDir = env.SOURCE_DIR ?: WORKSPACE
+                    def scanDir = env.SOURCE_DIR
                     sh "echo '=== SCA dependency scan on: ${scanDir} ==='"
                     sh "trivy fs --scanners vuln --severity CRITICAL,HIGH,MEDIUM --format json --output security-reports/trivy-sca.json '${scanDir}' || true"
                     sh "trivy fs --scanners vuln --severity CRITICAL,HIGH,MEDIUM --format table --output security-reports/trivy-sca.txt '${scanDir}' || true"
                 }
             }
         }
+
         stage('Image Scan') {
             when { expression { params.SCAN_TYPE in ['full', 'image-only'] } }
             steps {
@@ -154,13 +100,12 @@
                 }
             }
         }
+
         stage('K8s Manifest Scan') {
             when { expression { params.SCAN_TYPE in ['full', 'k8s-manifests'] } }
             steps {
                 script {
-                    // If user uploaded source with K8s manifests, scan those
-                    def scanDir = env.SOURCE_DIR ?: WORKSPACE
-                    // Look for yaml/yml files in uploaded source
+                    def scanDir = env.SOURCE_DIR
                     def hasK8s = sh(script: "find '${scanDir}' -name '*.yaml' -o -name '*.yml' 2>/dev/null | head -1", returnStdout: true).trim()
                     if (hasK8s) {
                         sh "echo '=== K8s manifest scan on: ${scanDir} ==='"
@@ -172,25 +117,27 @@
                 }
             }
         }
+
         stage('Registry Scan') {
             when { expression { return params.SCAN_REGISTRY_IMAGES } }
             steps {
                 script {
-                    def registry = env.REGISTRY
+                    def reg = env.REGISTRY
                     sh """
-                        echo "=== Scanning all images in registry: ${registry} ==="
-                        REPOS=\$(curl -s http://${registry}/v2/_catalog | python3 -c "import sys,json; [print(r) for r in json.load(sys.stdin).get('repositories',[])]" 2>/dev/null || echo "")
+                        echo '=== Scanning all images in registry: ${reg} ==='
+                        REPOS=\$(curl -s http://${reg}/v2/_catalog | python3 -c "import sys,json; [print(r) for r in json.load(sys.stdin).get('repositories',[])]" 2>/dev/null || echo "")
                         for REPO in \$REPOS; do
-                            TAGS=\$(curl -s http://${registry}/v2/\$REPO/tags/list | python3 -c "import sys,json; [print(t) for t in json.load(sys.stdin).get('tags',[])]" 2>/dev/null || echo "latest")
+                            TAGS=\$(curl -s http://${reg}/v2/\$REPO/tags/list | python3 -c "import sys,json; [print(t) for t in json.load(sys.stdin).get('tags',[])]" 2>/dev/null || echo "latest")
                             for TAG in \$TAGS; do
                                 echo "--- Scanning \$REPO:\$TAG ---"
-                                trivy image --podman-host '' --severity CRITICAL,HIGH --format table "${registry}/\$REPO:\$TAG" || true
+                                trivy image --podman-host '' --severity CRITICAL,HIGH --format table "${reg}/\$REPO:\$TAG" || true
                             done
                         done
                     """
                 }
             }
         }
+
         stage('Security Gate') {
             steps {
                 script {
@@ -220,7 +167,6 @@
                 // Cleanup uploaded source code
                 if (params.SOURCE_UPLOAD_PATH?.trim()) {
                     sh "rm -rf '${env.SOURCE_DIR}' 2>/dev/null || true"
-                    // Signal cleanup to the HTTP server
                     if (params.SCAN_ID?.trim()) {
                         sh """
                             curl -s -X POST http://132.186.17.22:9091/cleanup \
@@ -233,9 +179,4 @@
             echo 'Security scan complete.'
         }
     }
-}]]></script>
-    <sandbox>true</sandbox>
-  </definition>
-  <triggers/>
-  <disabled>false</disabled>
-</flow-definition>
+}
