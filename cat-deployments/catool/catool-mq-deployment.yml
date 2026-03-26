@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catool-mq-deployment
+  namespace: catool
+  labels:
+    app: catool-mq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catool-mq
+  template:
+    metadata:
+      labels:
+        app: catool-mq
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: "node.kubernetes.io/disk-pressure"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+        - name: catool-mq
+          image: 132.186.17.22:5000/rabbitmq:3-management
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5672
+            - containerPort: 15672

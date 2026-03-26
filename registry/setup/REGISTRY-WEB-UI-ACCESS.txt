@@ -1,0 +1,182 @@
+================================================================================
+🌐 DOCKER REGISTRY - WEB UI ACCESS
+================================================================================
+
+✅ VISUAL WEB UI NOW AVAILABLE!
+
+🖥️  ACCESS IN YOUR BROWSER:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  📱 MAIN WEB INTERFACE:
+     http://132.186.17.22:8080
+     
+     This provides a visual interface to:
+     ✓ Browse all images in the registry
+     ✓ View image tags
+     ✓ See image details and layers
+     ✓ Delete images (if needed)
+
+  📡 API ENDPOINTS (JSON format):
+     http://132.186.17.22:5000/v2/_catalog         (List all images)
+     http://132.186.17.22:5000/v2/postgres/tags/list
+     http://132.186.17.22:5000/v2/rabbitmq/tags/list
+     http://132.186.17.22:5000/v2/ubuntu/tags/list
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📦 CURRENT REGISTRY STATUS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Images Available (Ready to Use):
+  ✅ postgres:16
+  ✅ rabbitmq:3-management  
+  ✅ ubuntu:latest
+
+Images Missing (Need to Add):
+  ❌ catool:1-0-0-beta           (used by catool-deployment, catool-worker)
+  ❌ catool-ns:67-g0a02ff6      (used by catool-ns-db, catool-ns-deployment, catool-ns-ws)
+  ❌ catool-ui:259-g0719cf3     (used by catool-ui-deployment)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 WHAT YOU'LL SEE IN THE WEB UI:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When you open http://132.186.17.22:8080 you will see:
+
+1. A list of repositories (image names)
+2. Click on any image to see its tags
+3. Click on a tag to see:
+   - Image size
+   - Creation date
+   - Layers and their sizes
+   - Option to delete (if needed)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔌 SERVICES RUNNING:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Container Name    | Port | Purpose
+─────────────────────────────────────────────────────────
+registry          | 5000 | Docker Registry API (storage)
+registry-ui       | 8080 | Web UI (visual interface)
+
+Stop/Start Commands:
+  podman stop registry registry-ui
+  podman start registry registry-ui
+
+View Logs:
+  podman logs registry
+  podman logs registry-ui
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 NEXT STEPS TO GET DEPLOYMENTS WORKING:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Add Missing Application Images
+───────────────────────────────────────
+
+Option A: If you have the source code with Dockerfiles
+  cd /path/to/catool
+  podman build -t 132.186.17.22:5000/catool:1-0-0-beta .
+  podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+  
+  cd /path/to/catool-ns
+  podman build -t 132.186.17.22:5000/catool-ns:67-g0a02ff6 .
+  podman push 132.186.17.22:5000/catool-ns:67-g0a02ff6 --tls-verify=false
+  
+  cd /path/to/catool-ui
+  podman build -t 132.186.17.22:5000/catool-ui:259-g0719cf3 .
+  podman push 132.186.17.22:5000/catool-ui:259-g0719cf3 --tls-verify=false
+
+Option B: If you can access the original registry
+  podman pull perfteam-registry.advantest.com/catool:1-0-0-beta
+  podman tag perfteam-registry.advantest.com/catool:1-0-0-beta \
+              132.186.17.22:5000/catool:1-0-0-beta
+  podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+  
+  # Repeat for catool-ns and catool-ui
+
+After pushing, refresh the web UI to see the new images!
+
+Step 2: Configure Kubernetes Nodes
+───────────────────────────────────
+
+Run this on EACH Kubernetes node:
+  bash /root/Downloads/configure-k8s-insecure-registry.sh
+
+Or manually add to /etc/containerd/config.toml:
+  [plugins."io.containerd.grpc.v1.cri".registry.configs."132.186.17.22:5000"]
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."132.186.17.22:5000".tls]
+      insecure_skip_verify = true
+  
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."132.186.17.22:5000"]
+    endpoint = ["http://132.186.17.22:5000"]
+
+Then: systemctl restart containerd
+
+Step 3: Restart Deployments
+───────────────────────────
+
+Once images are in registry and nodes are configured:
+  kubectl rollout restart deployment -n catool
+  kubectl rollout restart deployment -n catool-ns
+  kubectl rollout restart deployment -n catool-ui
+
+Monitor:
+  kubectl get pods -n catool -w
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔒 SECURITY NOTES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  This setup is for DEVELOPMENT/TESTING only!
+
+Current configuration:
+  ❌ No TLS/SSL encryption (HTTP only)
+  ❌ No authentication required
+  ❌ Anyone on network can access if no firewall
+
+For production, implement:
+  ✅ TLS certificates
+  ✅ Basic auth or token authentication
+  ✅ Firewall rules to restrict access
+  ✅ Regular backups of registry data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📞 TROUBLESHOOTING:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❓ Web UI shows no images?
+   → Check registry is running: podman ps | grep registry
+   → Test API: curl http://132.186.17.22:5000/v2/_catalog
+
+❓ Can't access from browser?
+   → Verify port is open: ss -tuln | grep 8080
+   → Try SSH tunnel: ssh -L 8080:132.186.17.22:8080 root@132.186.17.22
+   → Then access: http://localhost:8080
+
+❓ Pods stuck in ImagePullBackOff?
+   → Images might not be in registry yet
+   → Check registry UI to confirm images exist
+   → Verify K8s nodes configured for insecure registry
+   → Check: kubectl describe pod <pod-name> -n <namespace>
+
+❓ Want to delete an image?
+   → Use the web UI - click on image tag, then delete button
+   → Or via API: curl -X DELETE http://132.186.17.22:5000/v2/<name>/manifests/<tag>
+
+================================================================================
+
+🎉 QUICK START:
+   1. Open browser → http://132.186.17.22:8080
+   2. Browse available images
+   3. Add missing application images (see Step 1 above)
+   4. Configure Kubernetes nodes (see Step 2 above)
+   5. Restart deployments (see Step 3 above)
+
+================================================================================

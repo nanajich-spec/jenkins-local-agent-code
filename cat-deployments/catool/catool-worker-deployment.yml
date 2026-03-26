@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catool-worker-deployment
+  namespace: catool
+  labels:
+    app: catool-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: catool-worker
+  template:
+    metadata:
+      labels:
+        app: catool-worker
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: "node.kubernetes.io/disk-pressure"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+        - name: catool-worker
+          image: 132.186.17.22:5000/catool:1-1-1-layers
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: catool-config-volume
+              mountPath: /app/config/config.yaml
+              subPath: config.yaml
+            - name: catool-data-volume
+              mountPath: /app/data
+            - name: catool-logs-volume
+              mountPath: /app/logs
+            - name: ssh-key-volume
+              mountPath: /root/.ssh/id_rsa
+              subPath: id_rsa
+              readOnly: true
+          args: ["worker"]
+          env:
+            - name: CATOOL_CONFIG_FILE
+              value: /app/config/config.yaml
+            - name: COMPLAB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: complab-secret
+                  key:  COMPLAB_PASSWORD
+      volumes:
+        - name: catool-config-volume
+          configMap:
+            name: catool-config
+        - name: catool-data-volume
+          hostPath:
+            path: /data/cat/data
+            type: DirectoryOrCreate
+        - name: catool-logs-volume
+          hostPath:
+            path: /data/cat/logs
+            type: DirectoryOrCreate
+        - name: ssh-key-volume
+          secret:
+            secretName: ssh-key-secret

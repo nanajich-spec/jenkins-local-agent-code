@@ -1,0 +1,56 @@
+#!/bin/bash
+# Script to push application images to local Docker registry
+
+REGISTRY="localhost:5000"
+
+echo "=== Pushing Application Images to Local Registry ==="
+echo "Registry: $REGISTRY"
+echo ""
+
+# List of images that were pulled from external registry (already in local registry)
+echo "✓ Already pushed to local registry:"
+echo "  - $REGISTRY/postgres:16"
+echo "  - $REGISTRY/rabbitmq:3-management"
+echo "  - $REGISTRY/ubuntu:latest"
+echo ""
+
+echo "=== Images that need to be built and pushed ==="
+echo ""
+echo "The following application images need to be built from source and pushed:"
+echo ""
+echo "1. catool application (version 1-0-0-beta)"
+echo "   podman build -t $REGISTRY/catool:1-0-0-beta <path-to-catool-source>"
+echo "   podman push $REGISTRY/catool:1-0-0-beta --tls-verify=false"
+echo ""
+echo "2. catool-ns application (version 67-g0a02ff6)"
+echo "   podman build -t $REGISTRY/catool-ns:67-g0a02ff6 <path-to-catool-ns-source>"
+echo "   podman push $REGISTRY/catool-ns:67-g0a02ff6 --tls-verify=false"
+echo ""
+echo "3. catool-ui application (version 259-g0719cf3)"
+echo "   podman build -t $REGISTRY/catool-ui:259-g0719cf3 <path-to-catool-ui-source>"
+echo "   podman push $REGISTRY/catool-ui:259-g0719cf3 --tls-verify=false"
+echo ""
+
+echo "=== Verify Registry Contents ==="
+curl -s http://$REGISTRY/v2/_catalog | jq .
+echo ""
+
+echo "=== Make Registry Accessible from Kubernetes ==="
+echo ""
+echo "Your registry is running on localhost:5000"
+echo "To make it accessible from Kubernetes pods, you may need to:"
+echo ""
+echo "1. If using Docker Desktop or Minikube:"
+echo "   - Add localhost:5000 as an insecure registry"
+echo "   - Or use the cluster's host IP instead of localhost"
+echo ""
+echo "2. For production, consider:"
+echo "   - Using a proper domain name"
+echo "   - Setting up TLS certificates"
+echo "   - Configuring image pull secrets if needed"
+echo ""
+echo "To check what's in your registry:"
+echo "  curl http://localhost:5000/v2/_catalog"
+echo ""
+echo "To get tags for an image:"
+echo "  curl http://localhost:5000/v2/<image-name>/tags/list"

@@ -1,0 +1,162 @@
+================================================================================
+STORAGE CLEANUP COMPLETED - SUMMARY REPORT
+================================================================================
+
+📊 STORAGE STATUS AFTER CLEANUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Master Node (INBLRMANAPPPH06 - 132.186.17.22):
+────────────────────────────────────────────────
+BEFORE Cleanup:
+  Total: 70GB
+  Used:  36GB
+  Free:  35GB
+  Usage: 51%
+  ⚠️  Limited space for builds
+
+AFTER Cleanup:
+  Total: 70GB
+  Used:  13GB
+  Free:  58GB
+  Usage: 18%
+  ✅  23GB freed - ready for builds!
+
+Worker Node (INBLRMANAPPPH04 - 132.186.17.8):
+────────────────────────────────────────────────
+  Total: 1.0TB
+  Used:  106GB
+  Free:  918GB
+  Usage: 11%
+  ✅  Plenty of space available
+
+Worker Node (INBLRMANAPPPH02 - 132.186.17.25):
+────────────────────────────────────────────────
+  Status: Not checked (likely similar to other nodes)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🗑️ IMAGES REMOVED (Master Node)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Large Unused Images:
+────────────────────
+✓ smartest-suite:8.6.1.0           22.5 GB (HUGE - not needed)
+✓ postgresql-13:1-109              501 MB  (duplicate)
+
+Duplicate Images Removed:
+─────────────────────────
+✓ localhost:5000/postgres:16       458 MB
+✓ localhost:5000/rabbitmq:3-mgmt   258 MB
+✓ localhost:5000/ubuntu:latest     81 MB
+
+Additional Cleanup:
+───────────────────
+✓ Unused layers and cache         ~1.1 GB
+✓ Unused volumes                   317 MB
+
+TOTAL SPACE RECLAIMED: ~24 GB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📦 CURRENT IMAGES (Master Node)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Active Images Only:
+────────────────────
+✓ registry:2                       26 MB    (running - registry service)
+✓ docker-registry-ui:latest        23 MB    (running - web UI)
+
+Total: 49 MB (very clean!)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ YOU CAN NOW BUILD IMAGES!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+With 58GB free space on the master node, you can now build your images:
+
+Build catool:
+─────────────
+cd /path/to/catool
+podman build -t 132.186.17.22:5000/catool:1-0-0-beta .
+podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+
+Build catool-ns:
+────────────────
+cd /path/to/catool-ns
+podman build -t 132.186.17.22:5000/catool-ns:67-g0a02ff6 .
+podman push 132.186.17.22:5000/catool-ns:67-g0a02ff6 --tls-verify=false
+
+Build catool-ui:
+────────────────
+cd /path/to/catool-ui
+podman build -t 132.186.17.22:5000/catool-ui:259-g0719cf3 .
+podman push 132.186.17.22:5000/catool-ui:259-g0719cf3 --tls-verify=false
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 MONITORING COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Check disk space:
+─────────────────
+df -h /
+
+Check Podman storage:
+─────────────────────
+podman system df
+
+List images:
+────────────
+podman images
+
+Clean up unused images (if needed):
+───────────────────────────────────
+podman system prune -a -f
+
+Clean up everything (careful!):
+───────────────────────────────
+podman system prune -a -f --volumes
+
+Check worker node storage:
+──────────────────────────
+ssh 132.186.17.8 "df -h /"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 TIPS TO AVOID FUTURE SPACE ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Regular Cleanup:
+   Run weekly: podman system prune -a -f
+
+2. Build Multi-stage Dockerfiles:
+   Use multi-stage builds to reduce final image size
+
+3. Remove old images after pushing to registry:
+   podman rmi <image-name> after successful push
+
+4. Monitor storage regularly:
+   Check: df -h / and podman system df
+
+5. Use .dockerignore:
+   Exclude unnecessary files from build context
+
+6. Clean build cache:
+   podman builder prune
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ✅ Storage cleaned - 24GB freed
+2. ✅ 58GB available for builds
+3. ⏭️  Build your 3 application images
+4. ⏭️  Push to registry (132.186.17.22:5000)
+5. ⏭️  Configure K8s nodes for insecure registry
+6. ⏭️  Restart deployments
+
+================================================================================
+ISSUE RESOLVED - READY TO BUILD!
+================================================================================

@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: catool-ui
+  name: catool-ui-ingress
+  labels:
+    app: catool-ui
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                 name: catool-ui-service
+                 port:
+                   number: 80

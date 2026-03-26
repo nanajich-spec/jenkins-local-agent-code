@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: catool-ui-service
+  namespace: catool-ui
+  labels:
+    app: catool-ui
+spec:
+  type: NodePort
+  selector:
+    app: catool-ui
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30080

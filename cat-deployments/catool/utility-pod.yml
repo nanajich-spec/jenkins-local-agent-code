@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: utility-pod
+  namespace: catool
+spec:
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node.kubernetes.io/disk-pressure"
+      operator: "Exists"
+      effect: "NoSchedule"
+  containers:
+    - name: utility-container
+      image: 132.186.17.22:5000/ubuntu:latest
+      command: ["sh", "-c", "apt-get update && apt-get install -y openssh-client && sleep 3600"]
+      volumeMounts:
+        - mountPath: /data/cat
+          name: catool-volume
+  volumes:
+    - name: catool-volume
+      hostPath:
+        path: /data/cat
+        type: DirectoryOrCreate

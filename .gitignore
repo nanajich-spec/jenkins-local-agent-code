@@ -1,0 +1,24 @@
+# Generated reports (download from Jenkins, don't commit)
+security-reports-*/
+pipeline-report-*/
+*.pyc
+__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jenkins agent working directory
+agent-workdir/
+remoting/
+
+# Temp files
+*.tmp
+*.bak
+*.log

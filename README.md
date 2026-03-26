@@ -1,24 +1,23 @@
-# Jenkins CI/CD Platform — Complete Documentation
+# DevOps Platform — Jenkins CI/CD, App Deployments & Container Registry
 
-> All-in-one Jenkins setup: infrastructure, CI/CD pipelines, security scanning,
-> multi-language support, testing, and deployment automation.
+> Centralized DevOps platform: Jenkins pipelines, security scanning, Kubernetes
+> application deployments, container registry management, and zero-setup scanning for all users.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Folder Structure](#folder-structure)
-3. [Quick Start](#quick-start)
-4. [Infrastructure Setup](#infrastructure-setup)
-5. [CI/CD Pipeline — How It Works](#cicd-pipeline--how-it-works)
-6. [Security Pipeline — How It Works](#security-pipeline--how-it-works)
-7. [Using Templates for Your Project](#using-templates-for-your-project)
-8. [Shared Library Reference](#shared-library-reference)
-9. [Testing Guide](#testing-guide)
-10. [Developer Workflow](#developer-workflow)
-11. [Configuration Reference](#configuration-reference)
-12. [Troubleshooting](#troubleshooting)
+2. [Repository Structure](#repository-structure)
+3. [Quick Start — For Users](#quick-start--for-users)
+4. [Quick Start — For Admins](#quick-start--for-admins)
+5. [Jenkins CI/CD](#jenkins-cicd)
+6. [Cat-Deployments (Application Manifests)](#cat-deployments)
+7. [Container Registry](#container-registry)
+8. [Security Scanning](#security-scanning)
+9. [Developer Workflow](#developer-workflow)
+10. [Configuration Reference](#configuration-reference)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -28,7 +27,7 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                    DEVELOPER WORKSTATION                        │
 │                                                                 │
-│  git push → triggers pipeline   OR   ./scripts/pipeline-trigger │
+│  git push → triggers pipeline   OR   ./jenkins/scripts/pipeline-trigger │
 └────────────────┬────────────────────────────────────────────────┘
                  │
                  ▼
@@ -68,74 +67,139 @@
 
 ---
 
-## Folder Structure
+## Repository Structure
 
 ```
-jenkins/
-├── IMPLEMENTATION-TRACKER.md   ← Track what's implemented
-├── README.md                   ← This file
+├── README.md                           ← This file
+├── .gitignore
 │
-├── infrastructure/             ← Jenkins K8s deployment
-│   ├── namespace.yml
-│   ├── deployment.yml
-│   ├── service.yml             (NodePort 32000)
-│   ├── pv.yml                  (20Gi, hostPath)
-│   ├── pvc.yml
-│   ├── service-account.yml     (cluster-admin)
-│   ├── deploy.sh               (one-command setup)
-│   └── configmaps/
-│       ├── init-groovy.yml     (admin user auto-setup)
-│       └── agent-init-groovy.yml (JNLP agent config)
+├── jenkins/                            ← Jenkins CI/CD Platform
+│   ├── infrastructure/                 ← K8s deployment manifests
+│   │   ├── deploy.sh                   (one-command setup)
+│   │   ├── namespace.yml
+│   │   ├── deployment.yml
+│   │   ├── service.yml                 (NodePort 32000)
+│   │   ├── pv.yml / pvc.yml
+│   │   ├── service-account.yml
+│   │   ├── kubernetes-group-cluster-admin.yaml
+│   │   ├── configmaps/
+│   │   │   ├── init-groovy.yml         (auto admin setup)
+│   │   │   └── agent-init-groovy.yml   (JNLP agent config)
+│   │   └── sonarqube/                  (SonarQube deployment)
+│   │
+│   ├── pipelines/
+│   │   ├── ci-cd/                      ← Universal CI/CD Pipeline
+│   │   │   ├── Jenkinsfile             (13 stages, multi-language)
+│   │   │   └── pipeline.yaml
+│   │   └── security/                   ← Security Scanning Pipeline
+│   │       ├── Jenkinsfile             (11 stages)
+│   │       └── pipeline.yaml
+│   │
+│   ├── scripts/
+│   │   ├── jenkins-agent-connect.sh    (agent setup/start/stop)
+│   │   ├── dev-security-scan.sh        (full automated scan)
+│   │   ├── pipeline-trigger.sh         (trigger via API)
+│   │   ├── install-security-tools.sh   (install Trivy, Grype, etc.)
+│   │   ├── scan-all-images.sh          (scan registry images)
+│   │   ├── create-pipeline-job.py      (create jobs via API)
+│   │   ├── run-full-security-scan.sh
+│   │   ├── setup-security-scanner.sh
+│   │   └── client/                     ← Zero-Setup Client Distribution
+│   │       ├── security-scan-client.sh (users download & run this)
+│   │       ├── serve-scan-client.sh    (admin: start HTTP server)
+│   │       └── scan-client-server.py   (HTTP distribution server)
+│   │
+│   ├── config/                         ← Scan configuration
+│   │   ├── trivy.yaml / .trivyignore
+│   │   ├── owasp-suppressions.xml
+│   │   ├── sonar-project.properties
+│   │   └── pipeline-job-config.xml
+│   │
+│   ├── shared-library/vars/            ← Reusable Groovy pipeline modules
+│   │   ├── detectLanguage.groovy
+│   │   ├── buildProject.groovy
+│   │   ├── securityScan.groovy
+│   │   ├── trivyImageScan.groovy
+│   │   └── ... (13 modules)
+│   │
+│   ├── templates/                      ← Jenkinsfile templates per language
+│   │   ├── Jenkinsfile.python
+│   │   ├── Jenkinsfile.java
+│   │   ├── Jenkinsfile.nodejs
+│   │   └── Jenkinsfile.go
+│   │
+│   └── sonarqube-jenkins-pipeline-bundle.sh
 │
-├── pipelines/
-│   ├── ci-cd/                  ← Universal CI/CD Pipeline
-│   │   ├── Jenkinsfile         (13 stages, all languages)
-│   │   └── pipeline.yaml       (config)
-│   └── security/               ← Security Scanning Pipeline
-│       ├── Jenkinsfile         (11 stages)
-│       └── pipeline.yaml       (config)
+├── cat-deployments/                    ← Application K8s Manifests
+│   ├── catool/                         (Backend API + Workers)
+│   │   ├── catool-deployment.yml
+│   │   ├── catool-service.yml
+│   │   ├── catool-ingress.yml
+│   │   ├── catool-postgres-*.yml       (Database)
+│   │   ├── catool-mq-*.yml            (RabbitMQ)
+│   │   └── catool-worker-deployment.yml
+│   │
+│   ├── catool-ns/                      (Notification Service)
+│   │   ├── catool-ns-deployment.yml
+│   │   ├── catool-ns-ws-*.yml          (WebSocket)
+│   │   └── catool-ns-db-deployment.yml
+│   │
+│   └── catool-ui/                      (Frontend UI)
+│       ├── catool-ui-deployment.yml
+│       ├── catool-ui-service.yml
+│       ├── catool-ui-ingress.yml
+│       └── tls-secret.yml
 │
-├── shared-library/vars/        ← Reusable Groovy modules
-│   ├── detectLanguage.groovy
-│   ├── buildProject.groovy
-│   ├── runTests.groovy
-│   ├── codeQuality.groovy
-│   ├── dockerBuild.groovy
-│   ├── deployToK8s.groovy
-│   ├── notifyResults.groovy
-│   ├── securityScan.groovy
-│   ├── trivyImageScan.groovy
-│   ├── trivyFsScan.groovy
-│   ├── trivyK8sScan.groovy
-│   ├── scanRegistryImages.groovy
-│   └── secretDetection.groovy
+├── registry/                           ← Container Registry Setup
+│   ├── setup/
+│   │   ├── LOCAL_REGISTRY_SETUP.md     (setup guide)
+│   │   ├── COMPLETE-REGISTRY-GUIDE.txt
+│   │   ├── REGISTRY-ACCESS-INFO.txt
+│   │   └── REGISTRY-WEB-UI-ACCESS.txt
+│   └── scripts/
+│       ├── push-images-to-local-registry.sh
+│       ├── configure-k8s-insecure-registry.sh
+│       ├── create-placeholder-images.sh
+│       └── test-registry-push.sh
 │
-├── config/                     ← Shared configuration files
-│   ├── trivy.yaml
-│   ├── .trivyignore
-│   ├── owasp-suppressions.xml
-│   ├── sonar-project.properties
-│   └── pipeline-job-config.xml
-│
-├── scripts/                    ← Automation scripts
-│   ├── install-security-tools.sh
-│   ├── jenkins-agent-connect.sh
-│   ├── setup-security-scanner.sh
-│   ├── dev-security-scan.sh
-│   ├── pipeline-trigger.sh
-│   ├── scan-all-images.sh
-│   └── create-pipeline-job.py
-│
-└── templates/                  ← Copy-paste Jenkinsfiles
-    ├── Jenkinsfile.python
-    ├── Jenkinsfile.java
-    ├── Jenkinsfile.nodejs
-    └── Jenkinsfile.go
+└── docs/                               ← Documentation
+    ├── USER-GUIDE-SECURITY-SCAN.md     (zero-setup user guide)
+    ├── DEPLOYMENT_SUMMARY.md
+    ├── IMPLEMENTATION-TRACKER.md
+    └── STORAGE-CLEANUP-REPORT.txt
 ```
 
 ---
 
-## Quick Start
+## Quick Start — For Users
+
+**Zero setup required.** Just run this ONE command from any machine on the network:
+
+```bash
+curl -sL http://132.186.17.22:9091/scan | bash
+```
+
+That's it. No tools, no agents, no configuration needed. Reports download to your local machine.
+
+```bash
+# Scan a specific image
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool-ns --tag 1.0.0
+
+# List available images in registry
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --list-images
+
+# View scan history
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --history
+
+# Check server status
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --status
+```
+
+See [docs/USER-GUIDE-SECURITY-SCAN.md](docs/USER-GUIDE-SECURITY-SCAN.md) for full details.
+
+---
+
+## Quick Start — For Admins
 
 ### 1. Deploy Jenkins (one command)
 
@@ -157,46 +221,55 @@ cd jenkins/scripts
 ### 3. Run a Pipeline
 
 **Option A — Use the universal CI/CD pipeline:**
-Copy `pipelines/ci-cd/Jenkinsfile` to your project root, push, and trigger.
+Copy `jenkins/pipelines/ci-cd/Jenkinsfile` to your project root, push, and trigger.
 
 **Option B — Use a language-specific template:**
-Copy the matching template from `templates/` to your project root as `Jenkinsfile`.
+Copy the matching template from `jenkins/templates/` to your project root as `Jenkinsfile`.
 
 **Option C — Trigger from terminal:**
 ```bash
-./scripts/pipeline-trigger.sh --image myapp --tag v1.0
+./jenkins/scripts/pipeline-trigger.sh --image myapp --tag v1.0
 ```
+
+### 4. Start Client Distribution Server
+
+```bash
+cd jenkins/scripts/client
+bash serve-scan-client.sh
+```
+
+This lets all users scan with `curl -sL http://132.186.17.22:9091/scan | bash`.
 
 ---
 
-## Infrastructure Setup
+## Jenkins CI/CD
 
 ### Kubernetes Resources
 
 | Resource | File | Details |
 |----------|------|---------|
-| Namespace | `infrastructure/namespace.yml` | `jenkins` namespace |
-| Deployment | `infrastructure/deployment.yml` | Jenkins LTS, 1 replica, hostNetwork |
-| Service | `infrastructure/service.yml` | NodePort 32000 (HTTP), 50000 (JNLP) |
-| PV | `infrastructure/pv.yml` | 20Gi, hostPath `/data/jenkins` |
-| PVC | `infrastructure/pvc.yml` | 20Gi, bound to jenkins-pv |
-| ServiceAccount | `infrastructure/service-account.yml` | cluster-admin role |
-| Init Groovy | `infrastructure/configmaps/init-groovy.yml` | Creates admin user |
-| Agent Config | `infrastructure/configmaps/agent-init-groovy.yml` | Enables JNLP4 on port 50000 |
+| Namespace | `jenkins/infrastructure/namespace.yml` | `jenkins` namespace |
+| Deployment | `jenkins/infrastructure/deployment.yml` | Jenkins LTS, 1 replica, hostNetwork |
+| Service | `jenkins/infrastructure/service.yml` | NodePort 32000 (HTTP), 50000 (JNLP) |
+| PV | `jenkins/infrastructure/pv.yml` | 20Gi, hostPath `/data/jenkins` |
+| PVC | `jenkins/infrastructure/pvc.yml` | 20Gi, bound to jenkins-pv |
+| ServiceAccount | `jenkins/infrastructure/service-account.yml` | cluster-admin role |
+| Init Groovy | `jenkins/infrastructure/configmaps/init-groovy.yml` | Creates admin user |
+| Agent Config | `jenkins/infrastructure/configmaps/agent-init-groovy.yml` | Enables JNLP4 on port 50000 |
 
 ### Deploy / Delete / Status
 
 ```bash
-./infrastructure/deploy.sh              # Deploy all resources
-./infrastructure/deploy.sh --status     # Check pod/service status
-./infrastructure/deploy.sh --delete     # Tear down everything
+./jenkins/infrastructure/deploy.sh              # Deploy all resources
+./jenkins/infrastructure/deploy.sh --status     # Check pod/service status
+./jenkins/infrastructure/deploy.sh --delete     # Tear down everything
 ```
 
 ---
 
 ## CI/CD Pipeline — How It Works
 
-The universal pipeline at `pipelines/ci-cd/Jenkinsfile` handles **any** project language
+The universal pipeline at `jenkins/pipelines/ci-cd/Jenkinsfile` handles **any** project language
 through auto-detection and language-specific stage logic.
 
 ### Pipeline Flow
@@ -292,7 +365,7 @@ through auto-detection and language-specific stage logic.
 
 ## Security Pipeline — How It Works
 
-The security pipeline at `pipelines/security/Jenkinsfile` focuses exclusively on
+The security pipeline at `jenkins/pipelines/security/Jenkinsfile` focuses exclusively on
 vulnerability scanning, secret detection, and compliance.
 
 ### Stages
@@ -313,13 +386,13 @@ vulnerability scanning, secret detection, and compliance.
 
 ```bash
 # Full scan
-bash scripts/dev-security-scan.sh
+bash jenkins/scripts/dev-security-scan.sh
 
 # Scan specific image
-bash scripts/dev-security-scan.sh --image catool --tag latest --type image-only
+bash jenkins/scripts/dev-security-scan.sh --image catool --tag latest --type image-only
 
 # Scan all registry images
-bash scripts/dev-security-scan.sh --scan-registry
+bash jenkins/scripts/dev-security-scan.sh --scan-registry
 ```
 
 ---
@@ -330,20 +403,20 @@ bash scripts/dev-security-scan.sh --scan-registry
 
 | Your Project | Template |
 |-------------|----------|
-| Python (Flask, Django, FastAPI) | `templates/Jenkinsfile.python` |
-| Java (Spring Boot, Maven/Gradle) | `templates/Jenkinsfile.java` |
-| Node.js / React / Angular / Vue | `templates/Jenkinsfile.nodejs` |
-| Go | `templates/Jenkinsfile.go` |
-| **Any language** (universal) | `pipelines/ci-cd/Jenkinsfile` |
+| Python (Flask, Django, FastAPI) | `jenkins/templates/Jenkinsfile.python` |
+| Java (Spring Boot, Maven/Gradle) | `jenkins/templates/Jenkinsfile.java` |
+| Node.js / React / Angular / Vue | `jenkins/templates/Jenkinsfile.nodejs` |
+| Go | `jenkins/templates/Jenkinsfile.go` |
+| **Any language** (universal) | `jenkins/pipelines/ci-cd/Jenkinsfile` |
 
 ### Step 2: Copy to your project
 
 ```bash
 # Python project
-cp templates/Jenkinsfile.python /path/to/your-project/Jenkinsfile
+cp jenkins/templates/Jenkinsfile.python /path/to/your-project/Jenkinsfile
 
 # OR use the universal pipeline (auto-detects language)
-cp pipelines/ci-cd/Jenkinsfile /path/to/your-project/Jenkinsfile
+cp jenkins/pipelines/ci-cd/Jenkinsfile /path/to/your-project/Jenkinsfile
 ```
 
 ### Step 3: Edit the variables
@@ -361,7 +434,7 @@ Open the Jenkinsfile and change:
 
 OR use the API script:
 ```bash
-python3 scripts/create-pipeline-job.py
+python3 jenkins/scripts/create-pipeline-job.py
 ```
 
 ---
@@ -503,10 +576,10 @@ your-project/
 
 ```bash
 # From terminal — trigger with parameters
-./scripts/pipeline-trigger.sh --image myapp --tag v2.0 --type full
+./jenkins/scripts/pipeline-trigger.sh --image myapp --tag v2.0 --type full
 
 # Security scan only
-bash scripts/dev-security-scan.sh --image myapp --tag v2.0 --type image-only
+bash jenkins/scripts/dev-security-scan.sh --image myapp --tag v2.0 --type image-only
 ```
 
 ---
@@ -526,11 +599,11 @@ bash scripts/dev-security-scan.sh --image myapp --tag v2.0 --type image-only
 
 | File | Purpose |
 |------|---------|
-| `config/trivy.yaml` | Trivy scanner settings (severity, scanners, license rules) |
-| `config/.trivyignore` | CVEs to suppress (accepted risks) |
-| `config/owasp-suppressions.xml` | OWASP Dependency-Check suppressions |
-| `config/sonar-project.properties` | SonarQube project settings |
-| `config/pipeline-job-config.xml` | Jenkins job definition (XML) |
+| `jenkins/config/trivy.yaml` | Trivy scanner settings (severity, scanners, license rules) |
+| `jenkins/config/.trivyignore` | CVEs to suppress (accepted risks) |
+| `jenkins/config/owasp-suppressions.xml` | OWASP Dependency-Check suppressions |
+| `jenkins/config/sonar-project.properties` | SonarQube project settings |
+| `jenkins/config/pipeline-job-config.xml` | Jenkins job definition (XML) |
 
 ---
 
@@ -546,11 +619,11 @@ kubectl logs -n jenkins -l app=jenkins
 ### Agent not connecting
 ```bash
 # Check agent status
-./scripts/jenkins-agent-connect.sh --status
+./jenkins/scripts/jenkins-agent-connect.sh --status
 
 # Restart agent
-./scripts/jenkins-agent-connect.sh --stop
-./scripts/jenkins-agent-connect.sh --start
+./jenkins/scripts/jenkins-agent-connect.sh --stop
+./jenkins/scripts/jenkins-agent-connect.sh --start
 
 # Check JNLP port
 curl -v http://<jenkins-ip>:50000
@@ -591,10 +664,10 @@ trivy image --download-db-only
 | Script | Purpose | Usage |
 |--------|---------|-------|
 | `infrastructure/deploy.sh` | Deploy/delete/status Jenkins on K8s | `./deploy.sh` |
-| `scripts/jenkins-agent-connect.sh` | Setup/start/stop JNLP agent | `./jenkins-agent-connect.sh --setup` |
-| `scripts/install-security-tools.sh` | Install Trivy, Grype, etc. | `sudo ./install-security-tools.sh` |
-| `scripts/dev-security-scan.sh` | One-command security scan | `bash dev-security-scan.sh` |
-| `scripts/pipeline-trigger.sh` | Trigger pipeline from terminal | `./pipeline-trigger.sh --image app` |
-| `scripts/scan-all-images.sh` | Scan all registry images | `./scan-all-images.sh` |
-| `scripts/setup-security-scanner.sh` | Host scanner for developers | `sudo ./setup-security-scanner.sh` |
-| `scripts/create-pipeline-job.py` | Create Jenkins job via API | `python3 create-pipeline-job.py` |
+| `jenkins/scripts/jenkins-agent-connect.sh` | Setup/start/stop JNLP agent | `./jenkins-agent-connect.sh --setup` |
+| `jenkins/scripts/install-security-tools.sh` | Install Trivy, Grype, etc. | `sudo ./install-security-tools.sh` |
+| `jenkins/scripts/dev-security-scan.sh` | One-command security scan | `bash dev-security-scan.sh` |
+| `jenkins/scripts/pipeline-trigger.sh` | Trigger pipeline from terminal | `./pipeline-trigger.sh --image app` |
+| `jenkins/scripts/scan-all-images.sh` | Scan all registry images | `./scan-all-images.sh` |
+| `jenkins/scripts/setup-security-scanner.sh` | Host scanner for developers | `sudo ./setup-security-scanner.sh` |
+| `jenkins/scripts/create-pipeline-job.py` | Create Jenkins job via API | `python3 create-pipeline-job.py` |

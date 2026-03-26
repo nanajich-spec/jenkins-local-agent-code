@@ -1,0 +1,356 @@
+================================================================================
+🐳 COMPLETE DOCKER REGISTRY SETUP - READY TO USE
+================================================================================
+
+📍 REGISTRY INFORMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Registry Host:     132.186.17.22
+Registry Port:     5000
+Full Registry URL: 132.186.17.22:5000
+Protocol:          HTTP (insecure - no TLS)
+Web UI Port:       8080
+
+🌐 ACCESS FROM YOUR WEB BROWSER (ANY SYSTEM)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ VISUAL WEB INTERFACE:
+   http://132.186.17.22:8080
+   
+   This works from ANY computer on your network!
+   - Browse all images visually
+   - View tags and layers
+   - See image sizes
+   - Delete images
+
+✅ API ENDPOINTS (JSON):
+   http://132.186.17.22:5000/v2/_catalog
+   http://132.186.17.22:5000/v2/<image-name>/tags/list
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 SETUP YOUR LOCAL MACHINE TO PUSH IMAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Configure Docker/Podman to Trust the Registry
+──────────────────────────────────────────────────────
+
+FOR DOCKER (on your local machine):
+────────────────────────────────────
+1. Edit or create: /etc/docker/daemon.json
+
+   sudo nano /etc/docker/daemon.json
+
+2. Add this content:
+
+   {
+     "insecure-registries": ["132.186.17.22:5000"]
+   }
+
+3. Save and restart Docker:
+
+   sudo systemctl restart docker
+
+   # On Mac/Windows Docker Desktop:
+   # Go to Settings → Docker Engine → Add to JSON → Apply & Restart
+
+
+FOR PODMAN (on your local machine):
+────────────────────────────────────
+1. Edit: /etc/containers/registries.conf
+
+   sudo nano /etc/containers/registries.conf
+
+2. Add to the end:
+
+   [[registry]]
+   location = "132.186.17.22:5000"
+   insecure = true
+
+3. No restart needed!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📦 HOW TO PUSH IMAGES TO THE REGISTRY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+METHOD 1: Build and Push New Image
+───────────────────────────────────
+
+# Build your image with registry URL in the name
+docker build -t 132.186.17.22:5000/catool:1-0-0-beta .
+
+# Or with Podman
+podman build -t 132.186.17.22:5000/catool:1-0-0-beta .
+
+# Push to registry
+docker push 132.186.17.22:5000/catool:1-0-0-beta
+# OR
+podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+
+
+METHOD 2: Tag Existing Local Image
+───────────────────────────────────
+
+# List your local images
+docker images
+# OR
+podman images
+
+# Tag an existing image
+docker tag myapp:latest 132.186.17.22:5000/myapp:latest
+# OR
+podman tag myapp:latest 132.186.17.22:5000/myapp:latest
+
+# Push to registry
+docker push 132.186.17.22:5000/myapp:latest
+# OR
+podman push 132.186.17.22:5000/myapp:latest --tls-verify=false
+
+
+METHOD 3: Pull from Another Registry and Re-push
+─────────────────────────────────────────────────
+
+# Pull from Docker Hub
+docker pull nginx:latest
+
+# Tag for your local registry
+docker tag nginx:latest 132.186.17.22:5000/nginx:latest
+
+# Push to your registry
+docker push 132.186.17.22:5000/nginx:latest
+
+
+METHOD 4: Load from TAR Archive
+────────────────────────────────
+
+# If you have image as tar file
+docker load -i myimage.tar
+# OR
+podman load -i myimage.tar
+
+# Find the loaded image ID
+docker images
+
+# Tag it
+docker tag <IMAGE_ID> 132.186.17.22:5000/myapp:version
+
+# Push it
+docker push 132.186.17.22:5000/myapp:version
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 SPECIFIC IMAGES YOU NEED TO ADD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Required Images for Your Deployments:
+──────────────────────────────────────
+
+1️⃣  catool:1-0-0-beta
+    docker build -t 132.186.17.22:5000/catool:1-0-0-beta /path/to/catool/
+    docker push 132.186.17.22:5000/catool:1-0-0-beta
+
+2️⃣  catool-ns:67-g0a02ff6
+    docker build -t 132.186.17.22:5000/catool-ns:67-g0a02ff6 /path/to/catool-ns/
+    docker push 132.186.17.22:5000/catool-ns:67-g0a02ff6
+
+3️⃣  catool-ui:259-g0719cf3
+    docker build -t 132.186.17.22:5000/catool-ui:259-g0719cf3 /path/to/catool-ui/
+    docker push 132.186.17.22:5000/catool-ui:259-g0719cf3
+
+Already in Registry (Working):
+───────────────────────────────
+✅ postgres:16
+✅ rabbitmq:3-management
+✅ ubuntu:latest
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ VERIFY IMAGES IN WEB UI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After pushing images:
+
+1. Open browser (from ANY computer):
+   http://132.186.17.22:8080
+
+2. You should immediately see your new images listed!
+
+3. Click on any image to:
+   - View all tags
+   - See image size
+   - View layers
+   - Check creation date
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔐 CONFIGURE KUBERNETES TO USE THE REGISTRY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+On EACH Kubernetes Node (Master + Workers):
+────────────────────────────────────────────
+
+Run the configuration script:
+  bash /root/Downloads/configure-k8s-insecure-registry.sh
+
+OR manually configure containerd:
+  
+  1. Edit: /etc/containerd/config.toml
+  
+  2. Add at the end:
+  
+     [plugins."io.containerd.grpc.v1.cri".registry.configs."132.186.17.22:5000"]
+       [plugins."io.containerd.grpc.v1.cri".registry.configs."132.186.17.22:5000".tls]
+         insecure_skip_verify = true
+     
+     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."132.186.17.22:5000"]
+       endpoint = ["http://132.186.17.22:5000"]
+  
+  3. Restart containerd:
+     systemctl restart containerd
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 QUICK REFERENCE COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+List all images in registry:
+  curl http://132.186.17.22:5000/v2/_catalog
+
+List tags for an image:
+  curl http://132.186.17.22:5000/v2/catool/tags/list
+
+Pull image from your registry:
+  docker pull 132.186.17.22:5000/catool:1-0-0-beta
+  # OR
+  podman pull 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+
+Delete image from registry (via API):
+  # Get manifest digest first
+  curl -I -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+       http://132.186.17.22:5000/v2/catool/manifests/1-0-0-beta
+  
+  # Delete using digest
+  curl -X DELETE http://132.186.17.22:5000/v2/catool/manifests/<digest>
+
+Check registry logs:
+  podman logs registry
+
+Check web UI logs:
+  podman logs registry-ui
+
+Restart services:
+  podman restart registry registry-ui
+
+Stop services:
+  podman stop registry registry-ui
+
+Start services:
+  podman start registry registry-ui
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🌍 ACCESSING FROM WINDOWS/MAC/LINUX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FROM WINDOWS:
+─────────────
+1. Open browser: http://132.186.17.22:8080
+2. For Docker Desktop:
+   - Settings → Docker Engine
+   - Add to JSON: "insecure-registries": ["132.186.17.22:5000"]
+   - Apply & Restart
+
+FROM MAC:
+─────────
+1. Open browser: http://132.186.17.22:8080
+2. For Docker Desktop:
+   - Preferences → Docker Engine
+   - Add to JSON: "insecure-registries": ["132.186.17.22:5000"]
+   - Apply & Restart
+
+FROM LINUX:
+───────────
+1. Open browser: http://132.186.17.22:8080
+2. Configure Docker/Podman (see setup section above)
+
+FROM ANY SYSTEM (using SSH tunnel):
+────────────────────────────────────
+If direct access blocked:
+  ssh -L 8080:132.186.17.22:8080 root@132.186.17.22
+  
+Then open: http://localhost:8080
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 EXAMPLE: COMPLETE WORKFLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# On your development machine:
+
+# 1. Configure Docker for insecure registry
+echo '{"insecure-registries": ["132.186.17.22:5000"]}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+
+# 2. Build your application
+cd /path/to/catool
+docker build -t 132.186.17.22:5000/catool:1-0-0-beta .
+
+# 3. Push to registry
+docker push 132.186.17.22:5000/catool:1-0-0-beta
+
+# 4. Verify in browser
+# Open: http://132.186.17.22:8080
+# You should see 'catool' image with tag '1-0-0-beta'
+
+# 5. Deploy to Kubernetes (already configured in your deployments)
+kubectl rollout restart deployment catool-deployment -n catool
+
+# 6. Watch deployment
+kubectl get pods -n catool -w
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 CURRENT STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Registry running on: 132.186.17.22:5000
+✅ Web UI running on: http://132.186.17.22:8080
+✅ Accessible from outside: YES
+✅ Kubernetes deployments configured: YES
+
+⚠️  Still needed:
+    - Add catool:1-0-0-beta image
+    - Add catool-ns:67-g0a02ff6 image
+    - Add catool-ui:259-g0719cf3 image
+    - Configure K8s nodes (run configure-k8s-insecure-registry.sh)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔥 QUICK TEST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Test push/pull with a simple image:
+
+# Pull nginx
+docker pull nginx:alpine
+
+# Tag for your registry
+docker tag nginx:alpine 132.186.17.22:5000/nginx:alpine
+
+# Push to your registry
+docker push 132.186.17.22:5000/nginx:alpine
+
+# Open browser
+http://132.186.17.22:8080
+
+# You should now see 'nginx' image with 'alpine' tag!
+
+# Pull from your registry
+docker pull 132.186.17.22:5000/nginx:alpine
+
+# Run it
+docker run -d -p 8888:80 132.186.17.22:5000/nginx:alpine
+
+================================================================================
+✅ YOUR REGISTRY IS READY TO USE!
+================================================================================

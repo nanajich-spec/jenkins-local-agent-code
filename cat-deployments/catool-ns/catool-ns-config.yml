@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catool-ns-config
+  namespace: catool-ns
+  labels:
+    app: catool-ns
+data:
+  config.yaml: |
+    tool_name: "CompLab Automation Tool"
+    catool_url: "http://132.186.17.22:31286/"
+    api_url: "http://132.186.17.22:30600/api/"
+    log_level: INFO
+    socketio_port: 5000
+    log_dir: /app/logs
+    catool_db: postgresql://admin:F35ygqvr75Z8Wg3qEfgG@catool-postgres-service.catool.svc.cluster.local:5432/catool
+    catool_mq: amqp://catool-mq-service.catool.svc.cluster.local:5672?heartbeat=30
+  config.js: |
+    const CONFIG = {
+      mock: false,
+      baseUrl: 'http://132.186.17.22:30600/',
+      default_lang: 'en-US',
+      app_version: 'v0.3.3',
+      socket_io_url: 'http://132.186.17.22:31472',
+    };

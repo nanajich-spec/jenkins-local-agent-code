@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catool-postgres-config
+  namespace: catool
+  labels:
+    app: catool-postgres
+data:
+  POSTGRES_DB: catool
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: F35ygqvr75Z8Wg3qEfgG

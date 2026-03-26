@@ -1,0 +1,129 @@
+================================================================================
+DOCKER REGISTRY - EXTERNAL ACCESS INFORMATION
+================================================================================
+
+Registry is now accessible from outside the SSH machine!
+
+CONNECTION DETAILS:
+------------------
+Registry URL: http://132.186.17.22:5000
+Host IP:      132.186.17.22
+Port:         5000
+Protocol:     HTTP (insecure - no TLS)
+
+BROWSER ACCESS:
+--------------
+Open your browser and navigate to:
+
+  http://132.186.17.22:5000/v2/_catalog
+
+This will show you all available images in JSON format.
+
+To see tags for a specific image:
+  http://132.186.17.22:5000/v2/postgres/tags/list
+  http://132.186.17.22:5000/v2/rabbitmq/tags/list
+  http://132.186.17.22:5000/v2/ubuntu/tags/list
+
+CURRENT IMAGES IN REGISTRY:
+--------------------------
+✓ postgres:16
+✓ rabbitmq:3-management
+✓ ubuntu:latest
+
+REQUIRED: Application Images Still Need to be Added
+---------------------------------------------------
+The following images are referenced in deployments but NOT yet in the registry:
+❌ catool:1-0-0-beta
+❌ catool-ns:67-g0a02ff6
+❌ catool-ui:259-g0719cf3
+
+To add these, you need to build them from source or pull from the original registry:
+
+1. If you have access to the original registry (perfteam-registry.advantest.com):
+   podman pull perfteam-registry.advantest.com/catool:1-0-0-beta
+   podman tag perfteam-registry.advantest.com/catool:1-0-0-beta 132.186.17.22:5000/catool:1-0-0-beta
+   podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+
+2. Or build from source if you have the Dockerfiles:
+   cd /path/to/catool/source
+   podman build -t 132.186.17.22:5000/catool:1-0-0-beta .
+   podman push 132.186.17.22:5000/catool:1-0-0-beta --tls-verify=false
+
+DOCKER/PODMAN CLIENT CONFIGURATION:
+----------------------------------
+To pull/push images from your local machine, you need to configure it to allow
+insecure registry access:
+
+For Docker:
+  Edit /etc/docker/daemon.json (create if doesn't exist):
+  {
+    "insecure-registries": ["132.186.17.22:5000"]
+  }
+  Then restart: sudo systemctl restart docker
+
+For Podman:
+  Add to /etc/containers/registries.conf:
+  [[registry]]
+  location = "132.186.17.22:5000"
+  insecure = true
+
+KUBERNETES ACCESS:
+-----------------
+All deployment files have been updated to use: 132.186.17.22:5000/image:tag
+
+Working images (pods should start):
+  - catool-postgres (postgres:16)
+  - catool-mq (rabbitmq:3-management)
+
+Failing images (need to be added to registry):
+  - catool-deployment (catool:1-0-0-beta)
+  - catool-worker (catool:1-0-0-beta)
+  - catool-ns-* (catool-ns:67-g0a02ff6)
+  - catool-ui (catool-ui:259-g0719cf3)
+
+SSH PORT FORWARDING (Alternative Access Method):
+------------------------------------------------
+If you can't access the registry directly from your browser, create an SSH tunnel:
+
+From your local machine, run:
+  ssh -L 5000:132.186.17.22:5000 user@132.186.17.22
+
+Then access via:
+  http://localhost:5000/v2/_catalog
+
+REGISTRY MANAGEMENT COMMANDS:
+----------------------------
+Check registry status:
+  podman ps | grep registry
+
+View registry logs:
+  podman logs registry
+
+Restart registry:
+  podman restart registry
+
+Stop registry:
+  podman stop registry
+
+Check disk usage:
+  podman volume inspect registry-data
+
+NETWORK VERIFICATION:
+--------------------
+Confirm port is listening:
+  ss -tuln | grep :5000
+
+Test from remote machine:
+  curl http://132.186.17.22:5000/v2/_catalog
+
+SECURITY NOTE:
+-------------
+⚠️  This registry is running WITHOUT TLS/SSL (HTTP only)
+⚠️  No authentication is required
+⚠️  Suitable for development/testing only
+⚠️  For production, implement:
+    - TLS certificates
+    - Basic authentication or token-based auth
+    - Firewall rules to limit access
+
+================================================================================

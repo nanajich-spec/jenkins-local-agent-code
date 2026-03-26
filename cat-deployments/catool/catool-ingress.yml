@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: catool
+  name: catool-ingress
+  labels:
+    app: catool
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api/catool(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: catool-service
+                port:
+                  number: 5000
+
+          - path: /()((?:catool/|auth|automated|manual|testers|loadboards|users|actions|miscsubtasks|version|notifications|roles|hosts|ops|locations).*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                 name: catool-service
+                 port:
+                   number: 5000

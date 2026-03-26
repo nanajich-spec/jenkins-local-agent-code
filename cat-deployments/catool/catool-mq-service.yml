@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: catool-mq-service
+  namespace: catool
+  labels:
+    app: catool-mq
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5672
+      targetPort: 5672
+      protocol: TCP
+      name: catool-mq-port
+  selector:
+    app: catool-mq
