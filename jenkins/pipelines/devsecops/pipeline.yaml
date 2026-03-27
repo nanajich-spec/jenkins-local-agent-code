@@ -1,0 +1,157 @@
+# =============================================================================
+# pipeline.yaml — DevSecOps Pipeline Configuration
+# =============================================================================
+# Configuration reference for the end-to-end DevSecOps pipeline.
+# Copy this to your project root and customize as needed.
+# =============================================================================
+
+pipeline:
+  name: devsecops-pipeline
+  description: "End-to-End DevSecOps Pipeline — Unit Testing, Docker Build, Security Scan, K8s Manifest Check, Final Report"
+
+# =============================================================================
+# Jenkins Connection
+# =============================================================================
+jenkins:
+  url: "http://132.186.17.25:32000"
+  credentials:
+    user: admin
+    # password via JENKINS_PASS env var
+
+# =============================================================================
+# Agent
+# =============================================================================
+agent:
+  label: "local-security-agent"
+
+# =============================================================================
+# Container Registry
+# =============================================================================
+registry:
+  url: "132.186.17.22:5000"
+  scheme: "http"
+  insecure: true
+
+# =============================================================================
+# Pipeline Stages Overview
+# =============================================================================
+#
+#  Stage                      Tool(s)                      Output Report
+#  ─────────────────────────  ───────────────────────────  ──────────────────────
+#  1. Checkout & Detect       git, file detection          -
+#  2. Verify Tools            all tools                    terminal output
+#  3. Install Dependencies    pip/npm/maven/go/dotnet      -
+#  4. Lint & Code Quality     flake8/eslint/pylint/bandit  flake8-report.txt, bandit-report.json
+#  5. Unit Testing            pytest/jest/go test/junit    pytest-results.xml, coverage.xml
+#  6. Integration Tests       pytest -m integration        pytest-integration-results.xml
+#  7. Build Application       make/python build/npm build  -
+#  8. Docker Image Build      podman/docker                -
+#  9. Docker Image Push       podman/docker push           -
+# 10. Trivy Image Scan        trivy image                  trivy-image-scan.json
+# 11. SAST & Secret Detection trivy fs (vuln,misconfig)    trivy-fs-scan.json, secret-scan.json
+# 12. SCA — Dependency Scan   trivy fs, OWASP DC, grype   trivy-sca.json, grype-sca.json
+# 13. Dockerfile Lint         hadolint                     hadolint.json
+# 14. ShellCheck              shellcheck                   shellcheck.json
+# 15. K8s Manifest Scan       trivy config, kubesec        trivy-k8s-config.json, kubesec-results.json
+# 16. Security Gate           aggregation                  gate-results.txt
+# 17. Deploy to K8s           kubectl                      -
+# 18. Final Report            python3 (parser)             TERMINAL OUTPUT
+#
+
+# =============================================================================
+# Test Configuration
+# =============================================================================
+tests:
+  unit:
+    enabled: true
+    framework:
+      python: "pytest"
+      java: "junit"
+      nodejs: "jest"
+      go: "go test"
+      dotnet: "xunit"
+    coverage_threshold: 70
+    pytest_args: "--tb=short -v"
+    reports:
+      - pytest-results.xml        # JUnit XML
+      - pytest-report.html        # HTML report
+      - coverage.xml              # Coverage XML
+      - htmlcov/index.html        # Coverage HTML
+
+  integration:
+    enabled: false
+    pytest_marker: "integration"
+
+# =============================================================================
+# Security Scan Configuration
+# =============================================================================
+security:
+  trivy:
+    severity: "CRITICAL,HIGH"
+    scanners:
+      - vuln
+      - misconfig
+      - secret
+      - license
+
+  hadolint:
+    enabled: true
+
+  shellcheck:
+    enabled: true
+
+  kubesec:
+    enabled: true
+
+  owasp_dependency_check:
+    enabled: false
+    fail_on_cvss: 7
+
+  grype:
+    enabled: false
+
+  sonarqube:
+    enabled: false
+    host_url: ""
+    project_key: ""
+
+  gate:
+    fail_on_critical: true
+    fail_on_secrets: true
+
+# =============================================================================
+# Docker Configuration
+# =============================================================================
+docker:
+  image_name: ""
+  image_tag: "latest"
+  dockerfile: "Dockerfile"
+  registry: "132.186.17.22:5000"
+  build_via_makefile: true    # Try `make docker-build` if Makefile exists
+
+# =============================================================================
+# Kubernetes Deployment
+# =============================================================================
+kubernetes:
+  deploy: false
+  namespace: ""
+  manifests_dir: "cat-deployments"
+
+# =============================================================================
+# Default Parameters (match Jenkinsfile params)
+# =============================================================================
+defaults:
+  language: "auto"
+  run_unit_tests: true
+  run_integration_tests: false
+  coverage_threshold: 70
+  run_trivy_scan: true
+  run_secret_detection: true
+  run_k8s_manifest_scan: true
+  run_dockerfile_lint: true
+  run_owasp_check: false
+  run_grype: false
+  run_sonarqube: false
+  fail_on_critical: true
+  deploy_to_k8s: false
+  timeout_minutes: 90

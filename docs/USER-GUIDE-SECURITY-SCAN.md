@@ -5,10 +5,10 @@
 You don't need to install anything. Just run ONE command from your project directory:
 
 ```bash
-curl -sL http://132.186.17.22:9091/scan | bash
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami)
 ```
 
-**That's it.** Your source code is uploaded to the central server, scanned, then cleaned up. Reports download to your machine.
+**That's it.** This works for **everyone on any machine** — `$(whoami)` automatically picks up the logged-in username. Your source code is uploaded to the central server, scanned, then cleaned up. Reports download to your machine.
 
 ### Requirements
 
@@ -27,20 +27,20 @@ The scan script requires `bash`. On Windows, use one of these options:
 **Option 1 — WSL (Recommended)**
 ```powershell
 # Open WSL terminal, then run:
-wsl curl -sL http://132.186.17.22:9091/scan | bash
+wsl curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami)
 ```
 
 **Option 2 — Git Bash**
 ```bash
 # Open Git Bash (installed with Git for Windows), then run:
-curl -sL http://132.186.17.22:9091/scan | bash
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami)
 ```
 
 **Option 3 — Download and run in WSL**
 ```powershell
 # From PowerShell: download the script, then run it in WSL
 curl -sL http://132.186.17.22:9091/scan -o scan.sh
-wsl bash scan.sh
+wsl bash scan.sh --user $(whoami)
 ```
 
 **If WSL gives errors** (e.g., `execvpe(/bin/bash) failed: No such file or directory`):
@@ -71,40 +71,40 @@ wsl --install -d Ubuntu
 ### Common Commands
 
 ```bash
-# Scan source code in current directory (default — just cd to your project and run)
-curl -sL http://132.186.17.22:9091/scan | bash
+# Scan source code in current directory (works for any user on any machine)
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami)
 
 # Scan a specific Docker image from the registry
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --tag latest
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --image catool --tag latest
 
 # Scan a specific image version
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool-ns --tag 1.0.0
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --image catool-ns --tag 1.0.0
 
 # Full scan: source code + Docker image
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --type full
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --image catool --type full
 
 # Scan type options
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --type code-only        # Source code scan (default)
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --image catool --type image-only  # Docker image only
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --type k8s-manifests    # Kubernetes YAML audit
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --type code-only        # Source code scan (default)
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --image catool --type image-only  # Docker image only
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --type k8s-manifests    # Kubernetes YAML audit
 
 # Scan ALL images in registry
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --scan-registry
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --scan-registry
 
 # List images available for scanning
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --list-images
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --list-images
 
 # View recent scan history
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --history
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --history
 
 # Check server status
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --status
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --status
 
 # Save reports to custom location
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --output /path/to/reports
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --output /path/to/reports
 
 # Get JSON summary (for scripts/CI)
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --json --quiet
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --json --quiet
 ```
 
 ### Save Locally for Repeated Use
@@ -114,10 +114,10 @@ curl -sL http://132.186.17.22:9091/scan | bash -s -- --json --quiet
 curl -sL http://132.186.17.22:9091/scan -o scan.sh
 
 # Run anytime
-bash scan.sh
-bash scan.sh --image catool --tag latest
-bash scan.sh --type k8s-manifests
-bash scan.sh --list-images
+bash scan.sh --user $(whoami)
+bash scan.sh --user $(whoami) --image catool --tag latest
+bash scan.sh --user $(whoami) --type k8s-manifests
+bash scan.sh --user $(whoami) --list-images
 ```
 
 ### What Happens When You Run It
@@ -183,6 +183,7 @@ Your Machine                          Central Server (132.186.17.22)
 
 Each scan is completely isolated:
 - **Unique Scan ID**: `username-hostname-timestamp` (e.g., `john-laptop01-1711411200`)
+- **`--user` override**: Use `--user <name>` to attribute a scan to a different user (e.g., `--user john`)
 - **Separate reports**: Each run saves to a timestamped directory
 - **No conflicts**: Multiple users can scan simultaneously
 - **No side effects**: Your scans don't affect other users
@@ -250,7 +251,7 @@ This:
 curl -s http://132.186.17.22:9091/scan | head -5
 
 # Test a scan
-curl -sL http://132.186.17.22:9091/scan | bash -s -- --status
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --status
 ```
 
 #### 4. Share with Team
@@ -259,7 +260,7 @@ Send ONE line to your team:
 
 ```
 To run a security scan, execute:
-curl -sL http://132.186.17.22:9091/scan | bash
+curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami)
 ```
 
 Or share the landing page URL: `http://132.186.17.22:9091/`

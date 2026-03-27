@@ -1,0 +1,1473 @@
+// =============================================================================
+// Jenkinsfile — End-to-End DevSecOps Pipeline
+// =============================================================================
+// Complete CI/CD + Security Pipeline with:
+//   1. Unit Testing (pytest/jest/go test/junit) with report publishing
+//   2. Code Quality & Linting
+//   3. Docker Image Build (auto-detect Dockerfile/Containerfile/Makefile)
+//   4. Trivy Image Scan
+//   5. SAST — Static Application Security Testing
+//   6. SCA — Software Composition Analysis
+//   7. Secret Detection
+//   8. Dockerfile Lint (Hadolint)
+//   9. K8s Deployment Manifest Scan (Trivy + Kubesec)
+//  10. OWASP Dependency Check / Grype
+//  11. Security Gate (pass/fail)
+//  12. Final Consolidated Terminal Report
+//
+// Supports: Python, Java, Node.js, Go, .NET (auto-detected)
+// =============================================================================
+
+pipeline {
+    agent { label params.AGENT_LABEL ?: 'local-security-agent' }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        timeout(time: params.TIMEOUT_MINUTES?.toInteger() ?: 90, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    environment {
+        REGISTRY         = "${params.REGISTRY ?: '132.186.17.22:5000'}"
+        REPORTS_DIR      = "${WORKSPACE}/pipeline-reports"
+        COVERAGE_THRESHOLD = "${params.COVERAGE_THRESHOLD ?: '70'}"
+        SCAN_SEVERITY    = 'CRITICAL,HIGH'
+        TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivy-cache"
+    }
+
+    parameters {
+        // ── Project Settings ──
+        string(name: 'GIT_REPO',             defaultValue: '',               description: 'Git repo URL (leave blank for workspace/SCM)')
+        string(name: 'GIT_BRANCH',           defaultValue: 'main',           description: 'Branch to build')
+        choice(name: 'LANGUAGE',             choices: ['auto', 'python', 'java-maven', 'java-gradle', 'nodejs', 'react', 'angular', 'go', 'dotnet'], description: 'Project language (auto-detect if unsure)')
+
+        // ── Docker Settings ──
+        string(name: 'IMAGE_NAME',           defaultValue: '',               description: 'Docker image name (leave blank to skip Docker)')
+        string(name: 'IMAGE_TAG',            defaultValue: 'latest',         description: 'Docker image tag')
+        string(name: 'REGISTRY',             defaultValue: '132.186.17.22:5000', description: 'Container registry URL')
+        string(name: 'DOCKERFILE_PATH',      defaultValue: 'Dockerfile',     description: 'Dockerfile path (or Containerfile)')
+
+        // ── Test Settings ──
+        booleanParam(name: 'RUN_UNIT_TESTS',      defaultValue: true,   description: 'Run unit tests (pytest/jest/go test/junit)')
+        booleanParam(name: 'RUN_INTEGRATION_TESTS', defaultValue: false, description: 'Run integration tests')
+        string(name: 'COVERAGE_THRESHOLD',         defaultValue: '70',   description: 'Minimum code coverage %')
+        string(name: 'PYTEST_ARGS',                defaultValue: '',     description: 'Extra pytest arguments (e.g., -k "test_api")')
+
+        // ── Security Settings ──
+        booleanParam(name: 'RUN_TRIVY_SCAN',       defaultValue: true,   description: 'Run Trivy image & filesystem scan')
+        booleanParam(name: 'RUN_SECRET_DETECTION',  defaultValue: true,   description: 'Run secret detection')
+        booleanParam(name: 'RUN_K8S_MANIFEST_SCAN', defaultValue: true,   description: 'Scan K8s deployment manifests')
+        booleanParam(name: 'RUN_DOCKERFILE_LINT',    defaultValue: true,   description: 'Lint Dockerfile with Hadolint')
+        booleanParam(name: 'RUN_OWASP_CHECK',       defaultValue: false,  description: 'Run OWASP Dependency-Check')
+        booleanParam(name: 'RUN_GRYPE',              defaultValue: false,  description: 'Run Grype vulnerability scan')
+        booleanParam(name: 'RUN_SONARQUBE',          defaultValue: false,  description: 'Run SonarQube analysis')
+        booleanParam(name: 'FAIL_ON_CRITICAL',       defaultValue: true,   description: 'Fail build on CRITICAL vulnerabilities')
+
+        // ── Deploy Settings ──
+        booleanParam(name: 'DEPLOY_TO_K8S',        defaultValue: false,  description: 'Deploy to Kubernetes after scan')
+        string(name: 'K8S_NAMESPACE',              defaultValue: '',     description: 'Kubernetes namespace')
+        string(name: 'K8S_MANIFESTS_DIR',           defaultValue: 'cat-deployments', description: 'Path to K8s manifest directory')
+
+        // ── Agent ──
+        string(name: 'AGENT_LABEL',               defaultValue: 'local-security-agent', description: 'Jenkins agent label')
+        string(name: 'TIMEOUT_MINUTES',            defaultValue: '90',   description: 'Pipeline timeout (minutes)')
+    }
+
+    stages {
+
+        // =====================================================================
+        // STAGE 1: Checkout & Language Detection
+        // =====================================================================
+        stage('Checkout & Detect Language') {
+            steps {
+                script {
+                    // Checkout if Git repo provided
+                    if (params.GIT_REPO?.trim()) {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.GIT_BRANCH}"]],
+                            userRemoteConfigs: [[url: params.GIT_REPO]],
+                            extensions: [[$class: 'CloneOption', depth: 1, shallow: true]]
+                        ])
+                    }
+
+                    sh "mkdir -p '${REPORTS_DIR}'"
+
+                    // Auto-detect language
+                    env.DETECTED_LANG = params.LANGUAGE
+                    if (params.LANGUAGE == 'auto') {
+                        env.DETECTED_LANG = detectLanguage()
+                    }
+
+                    // Detect Dockerfile
+                    env.HAS_DOCKERFILE = fileExists(params.DOCKERFILE_PATH ?: 'Dockerfile') || fileExists('Containerfile') ? 'true' : 'false'
+                    env.HAS_MAKEFILE   = fileExists('Makefile') ? 'true' : 'false'
+
+                    // Detect K8s manifests
+                    env.HAS_K8S_MANIFESTS = sh(script: "find '${params.K8S_MANIFESTS_DIR ?: 'cat-deployments'}' -name '*.yml' -o -name '*.yaml' 2>/dev/null | head -1", returnStdout: true).trim() ? 'true' : 'false'
+
+                    // Pipeline start timestamp
+                    env.PIPELINE_START = sh(script: 'date +%s', returnStdout: true).trim()
+
+                    echo """
+╔══════════════════════════════════════════════════════════════╗
+║          DevSecOps Pipeline — Configuration                  ║
+╠══════════════════════════════════════════════════════════════╣
+║  Language:        ${env.DETECTED_LANG.padRight(40)}║
+║  Branch:          ${(params.GIT_BRANCH ?: 'workspace').padRight(40)}║
+║  Docker Image:    ${(params.IMAGE_NAME ?: 'N/A').padRight(40)}║
+║  Dockerfile:      ${env.HAS_DOCKERFILE.padRight(40)}║
+║  Makefile:        ${env.HAS_MAKEFILE.padRight(40)}║
+║  K8s Manifests:   ${env.HAS_K8S_MANIFESTS.padRight(40)}║
+║  Unit Tests:      ${params.RUN_UNIT_TESTS.toString().padRight(40)}║
+║  Trivy Scan:      ${params.RUN_TRIVY_SCAN.toString().padRight(40)}║
+║  K8s Scan:        ${params.RUN_K8S_MANIFEST_SCAN.toString().padRight(40)}║
+║  Fail on Crit:    ${params.FAIL_ON_CRITICAL.toString().padRight(40)}║
+╚══════════════════════════════════════════════════════════════╝
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 2: Tool Verification
+        // =====================================================================
+        stage('Verify Tools') {
+            steps {
+                sh '''
+                    echo "╔══════════════════════════════════════════════════════════════╗"
+                    echo "║              Tool Verification                               ║"
+                    echo "╠══════════════════════════════════════════════════════════════╣"
+
+                    check_tool() {
+                        local name="$1" cmd="$2"
+                        if command -v "$cmd" &>/dev/null; then
+                            VER=$($cmd --version 2>&1 | head -1)
+                            printf "║  %-18s ✅  %s\\n" "$name" "$VER"
+                        else
+                            printf "║  %-18s ❌  Not installed\\n" "$name"
+                        fi
+                    }
+
+                    check_tool "Python"     "python3"
+                    check_tool "pip"        "pip"
+                    check_tool "Node.js"    "node"
+                    check_tool "Go"         "go"
+                    check_tool "Java"       "java"
+                    check_tool "Trivy"      "trivy"
+                    check_tool "Podman"     "podman"
+                    check_tool "Hadolint"   "hadolint"
+                    check_tool "ShellCheck" "shellcheck"
+                    check_tool "Grype"      "grype"
+                    check_tool "Kubesec"    "kubesec"
+                    check_tool "kubectl"    "kubectl"
+
+                    echo "╚══════════════════════════════════════════════════════════════╝"
+                '''
+            }
+        }
+
+        // =====================================================================
+        // STAGE 3: Install Dependencies
+        // =====================================================================
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Installing Python Dependencies ==="
+                                python3 -m pip install --upgrade pip
+                                if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+                                if [ -f "requirements-dev.txt" ]; then pip install -r requirements-dev.txt; fi
+                                if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+                                    pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+                                fi
+                                # Ensure test/lint tools are installed
+                                pip install pytest pytest-cov pytest-html pytest-xdist \
+                                    flake8 black mypy bandit safety pylint 2>/dev/null || true
+                            '''
+                            break
+                        case 'java-maven':
+                            sh 'mvn dependency:resolve -q 2>/dev/null || true'
+                            break
+                        case 'java-gradle':
+                            sh '''
+                                chmod +x gradlew 2>/dev/null || true
+                                ./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null || true
+                            '''
+                            break
+                        case ['nodejs', 'react', 'angular']:
+                            sh '''
+                                if [ -f "yarn.lock" ]; then
+                                    yarn install --frozen-lockfile 2>/dev/null || yarn install
+                                elif [ -f "package-lock.json" ] || [ -f "package.json" ]; then
+                                    npm ci 2>/dev/null || npm install
+                                fi
+                            '''
+                            break
+                        case 'go':
+                            sh 'go mod download && go mod verify'
+                            break
+                        case 'dotnet':
+                            sh 'dotnet restore'
+                            break
+                        default:
+                            echo "No dependency installation for: ${env.DETECTED_LANG}"
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 4: Lint & Code Quality
+        // =====================================================================
+        stage('Lint & Code Quality') {
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "╔══════════════════════════════════════════════════════════════╗"
+                                echo "║              Python Code Quality                             ║"
+                                echo "╚══════════════════════════════════════════════════════════════╝"
+
+                                echo "--- Flake8 ---"
+                                flake8 . --max-line-length=120 \
+                                    --exclude=.venv,venv,__pycache__,migrations,.trivy-cache,pipeline-reports \
+                                    --output-file="${REPORTS_DIR}/flake8-report.txt" 2>/dev/null || true
+                                cat "${REPORTS_DIR}/flake8-report.txt" 2>/dev/null || true
+
+                                echo ""
+                                echo "--- Black (format check) ---"
+                                black --check --diff . --exclude '/(\.venv|venv|__pycache__|\.trivy-cache)/' 2>/dev/null || echo "Formatting issues found (non-blocking)"
+
+                                echo ""
+                                echo "--- Pylint ---"
+                                find . -name "*.py" -not -path "./.venv/*" -not -path "./venv/*" -not -path "./.trivy-cache/*" \
+                                    | head -20 | xargs pylint --output-format=text --score=yes \
+                                    > "${REPORTS_DIR}/pylint-report.txt" 2>/dev/null || true
+                                tail -5 "${REPORTS_DIR}/pylint-report.txt" 2>/dev/null || true
+
+                                echo ""
+                                echo "--- Bandit (security linter) ---"
+                                bandit -r . -f json -o "${REPORTS_DIR}/bandit-report.json" \
+                                    --exclude .venv,venv,tests,test,.trivy-cache 2>/dev/null || true
+                                bandit -r . --exclude .venv,venv,tests,test,.trivy-cache \
+                                    -f screen 2>/dev/null | tail -20 || true
+                            '''
+                            break
+                        case 'java-maven':
+                            sh 'mvn checkstyle:check -q 2>/dev/null || echo "Checkstyle issues (non-blocking)"'
+                            break
+                        case 'java-gradle':
+                            sh './gradlew checkstyleMain 2>/dev/null || echo "Checkstyle not configured"'
+                            break
+                        case ['nodejs', 'react', 'angular']:
+                            sh '''
+                                echo "--- ESLint ---"
+                                if [ -f "node_modules/.bin/eslint" ]; then
+                                    npx eslint . --format json --output-file "${REPORTS_DIR}/eslint-report.json" 2>/dev/null || true
+                                fi
+                                echo "--- Prettier ---"
+                                if [ -f "node_modules/.bin/prettier" ]; then
+                                    npx prettier --check "src/**/*.{js,jsx,ts,tsx}" 2>/dev/null || echo "Format issues found"
+                                fi
+                            '''
+                            break
+                        case 'go':
+                            sh '''
+                                echo "--- Go Vet ---"
+                                go vet ./... 2>&1 | tee "${REPORTS_DIR}/govet-report.txt" || true
+                                echo "--- golangci-lint ---"
+                                golangci-lint run 2>/dev/null || echo "golangci-lint not available"
+                            '''
+                            break
+                        case 'dotnet':
+                            sh 'dotnet format --verify-no-changes 2>/dev/null || echo "Format issues found"'
+                            break
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 5: Unit Testing (pytest / jest / go test / junit)
+        // =====================================================================
+        stage('Unit Testing') {
+            when { expression { params.RUN_UNIT_TESTS } }
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh """
+                                echo "╔══════════════════════════════════════════════════════════════╗"
+                                echo "║        Unit Testing — pytest                                 ║"
+                                echo "╚══════════════════════════════════════════════════════════════╝"
+
+                                # Run pytest with full reporting
+                                python3 -m pytest \
+                                    --junitxml="${REPORTS_DIR}/pytest-results.xml" \
+                                    --html="${REPORTS_DIR}/pytest-report.html" --self-contained-html \
+                                    --cov=. \
+                                    --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
+                                    --cov-report=html:"${REPORTS_DIR}/htmlcov" \
+                                    --cov-report=term-missing \
+                                    --cov-fail-under=${COVERAGE_THRESHOLD} \
+                                    --tb=short \
+                                    -v \
+                                    ${params.PYTEST_ARGS ?: ''} \
+                                    2>&1 || {
+                                        echo "=== pytest finished with failures ==="
+
+                                        # Still show results summary
+                                        echo ""
+                                        echo "╔══════════════════════════════════════════════════════════════╗"
+                                        echo "║              Test Results Summary                            ║"
+                                        echo "╚══════════════════════════════════════════════════════════════╝"
+
+                                        if [ -f "${REPORTS_DIR}/pytest-results.xml" ]; then
+                                            python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/pytest-results.xml')
+root = tree.getroot()
+tests   = root.attrib.get('tests', '0')
+errors  = root.attrib.get('errors', '0')
+failures= root.attrib.get('failures', '0')
+skipped = root.attrib.get('skipped', '0')
+time_s  = root.attrib.get('time', '0')
+passed  = int(tests) - int(errors) - int(failures) - int(skipped)
+print(f'  Total Tests:    {tests}')
+print(f'  Passed:         {passed}')
+print(f'  Failed:         {failures}')
+print(f'  Errors:         {errors}')
+print(f'  Skipped:        {skipped}')
+print(f'  Duration:       {float(time_s):.2f}s')
+print()
+# Print failed test names
+for tc in root.iter('testcase'):
+    for fail in tc.findall('failure'):
+        print(f'  FAILED: {tc.attrib.get(\"classname\",\"\")}.{tc.attrib.get(\"name\",\"\")}')
+        print(f'          {fail.attrib.get(\"message\",\"\")[:120]}')
+" 2>/dev/null || true
+                                        fi
+
+                                        # Show coverage summary
+                                        if [ -f "${REPORTS_DIR}/coverage.xml" ]; then
+                                            python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/coverage.xml')
+root = tree.getroot()
+rate = float(root.attrib.get('line-rate', 0)) * 100
+lines = root.attrib.get('lines-valid', '?')
+print(f'  Coverage:       {rate:.1f}% ({lines} lines)')
+" 2>/dev/null || true
+                                        fi
+                                        true  # Don't fail the stage
+                                    }
+
+                                # Always print summary
+                                echo ""
+                                echo "╔══════════════════════════════════════════════════════════════╗"
+                                echo "║              Test Results Summary                            ║"
+                                echo "╚══════════════════════════════════════════════════════════════╝"
+
+                                if [ -f "${REPORTS_DIR}/pytest-results.xml" ]; then
+                                    python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/pytest-results.xml')
+root = tree.getroot()
+tests   = root.attrib.get('tests', '0')
+errors  = root.attrib.get('errors', '0')
+failures= root.attrib.get('failures', '0')
+skipped = root.attrib.get('skipped', '0')
+time_s  = root.attrib.get('time', '0')
+passed  = int(tests) - int(errors) - int(failures) - int(skipped)
+status  = 'PASS' if int(failures) == 0 and int(errors) == 0 else 'FAIL'
+print(f'  Status:         {status}')
+print(f'  Total Tests:    {tests}')
+print(f'  Passed:         {passed}')
+print(f'  Failed:         {failures}')
+print(f'  Errors:         {errors}')
+print(f'  Skipped:        {skipped}')
+print(f'  Duration:       {float(time_s):.2f}s')
+" 2>/dev/null || echo "  (Unable to parse test results)"
+                                fi
+
+                                # Coverage
+                                if [ -f "${REPORTS_DIR}/coverage.xml" ]; then
+                                    python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/coverage.xml')
+root = tree.getroot()
+rate  = float(root.attrib.get('line-rate', 0)) * 100
+lines = root.attrib.get('lines-valid', '?')
+covered = root.attrib.get('lines-covered', '?')
+print(f'  Line Coverage:  {rate:.1f}%  ({covered}/{lines} lines)')
+print(f'  Threshold:      ${COVERAGE_THRESHOLD}%')
+threshold = float('${COVERAGE_THRESHOLD}')
+if rate >= threshold:
+    print(f'  Gate:           PASS')
+else:
+    print(f'  Gate:           FAIL  (below {threshold}%)')
+" 2>/dev/null || true
+                                fi
+
+                                echo "  Reports:"
+                                echo "    - ${REPORTS_DIR}/pytest-results.xml     (JUnit XML)"
+                                echo "    - ${REPORTS_DIR}/pytest-report.html     (HTML Report)"
+                                echo "    - ${REPORTS_DIR}/coverage.xml           (Coverage XML)"
+                                echo "    - ${REPORTS_DIR}/htmlcov/index.html     (Coverage HTML)"
+                            """
+                            break
+
+                        case 'java-maven':
+                            sh '''
+                                echo "=== Maven — JUnit Tests ==="
+                                mvn test -Dmaven.test.failure.ignore=true 2>/dev/null || echo "Tests completed"
+                                cp -r target/surefire-reports/* "${REPORTS_DIR}/" 2>/dev/null || true
+                                cp target/site/jacoco/jacoco.xml "${REPORTS_DIR}/jacoco-coverage.xml" 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'java-gradle':
+                            sh '''
+                                echo "=== Gradle — JUnit Tests ==="
+                                ./gradlew test --continue 2>/dev/null || gradle test --continue 2>/dev/null || echo "Tests completed"
+                                cp -r build/test-results/test/* "${REPORTS_DIR}/" 2>/dev/null || true
+                            '''
+                            break
+
+                        case ['nodejs', 'react', 'angular']:
+                            sh '''
+                                echo "=== Jest / Mocha — Unit Tests ==="
+                                if grep -q '"test"' package.json 2>/dev/null; then
+                                    npx jest --ci --coverage \
+                                        --coverageDirectory="${REPORTS_DIR}/coverage" \
+                                        --coverageReporters=json-summary --coverageReporters=lcov --coverageReporters=text \
+                                        --reporters=default --reporters=jest-junit \
+                                        2>/dev/null || npm test 2>/dev/null || echo "Tests completed"
+                                    cp coverage/lcov.info "${REPORTS_DIR}/lcov.info" 2>/dev/null || true
+                                else
+                                    echo "No test script in package.json"
+                                fi
+                            '''
+                            break
+
+                        case 'go':
+                            sh '''
+                                echo "=== Go Test — Unit Tests ==="
+                                go test ./... -v -count=1 \
+                                    -coverprofile="${REPORTS_DIR}/go-coverage.out" \
+                                    -json > "${REPORTS_DIR}/go-test-results.json" 2>&1 || echo "Tests completed"
+                                go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | tail -5 || true
+                                go tool cover -html="${REPORTS_DIR}/go-coverage.out" -o "${REPORTS_DIR}/go-coverage.html" 2>/dev/null || true
+                            '''
+                            break
+
+                        case 'dotnet':
+                            sh '''
+                                echo "=== dotnet test ==="
+                                dotnet test \
+                                    --logger "trx;LogFileName=${REPORTS_DIR}/test-results.trx" \
+                                    --collect:"XPlat Code Coverage" \
+                                    --results-directory "${REPORTS_DIR}" \
+                                    -v normal || echo "Tests completed"
+                            '''
+                            break
+                    }
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: "${REPORTS_DIR}/**/*.xml"
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 6: Integration Tests (optional)
+        // =====================================================================
+        stage('Integration Tests') {
+            when { expression { params.RUN_INTEGRATION_TESTS } }
+            steps {
+                script {
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            sh '''
+                                echo "=== Pytest — Integration Tests ==="
+                                python3 -m pytest tests/integration/ \
+                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
+                                    -v -m "integration" 2>/dev/null || \
+                                python3 -m pytest -m "integration" \
+                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
+                                    -v 2>/dev/null || echo "No integration tests found"
+                            '''
+                            break
+                        case 'java-maven':
+                            sh 'mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true || echo "No integration tests"'
+                            break
+                        case ['nodejs', 'react', 'angular']:
+                            sh '''
+                                if grep -q '"test:integration"' package.json 2>/dev/null; then
+                                    npm run test:integration
+                                else
+                                    echo "No integration test script found"
+                                fi
+                            '''
+                            break
+                        case 'go':
+                            sh 'go test ./... -v -tags=integration -json > "${REPORTS_DIR}/go-integration.json" 2>&1 || echo "No integration tests"'
+                            break
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 7: Build Application (Makefile / language build)
+        // =====================================================================
+        stage('Build Application') {
+            steps {
+                script {
+                    if (env.HAS_MAKEFILE == 'true') {
+                        sh '''
+                            echo "=== Building via Makefile ==="
+                            make build 2>/dev/null || make all 2>/dev/null || make 2>/dev/null || echo "make build completed"
+                        '''
+                    } else {
+                        switch (env.DETECTED_LANG) {
+                            case 'python':
+                                sh '''
+                                    if [ -f "setup.py" ]; then
+                                        python3 setup.py bdist_wheel 2>/dev/null || true
+                                    elif [ -f "pyproject.toml" ]; then
+                                        pip install build && python3 -m build 2>/dev/null || true
+                                    else
+                                        echo "No build step needed (script-based project)"
+                                    fi
+                                '''
+                                break
+                            case 'java-maven':
+                                sh 'mvn package -DskipTests -q'
+                                break
+                            case 'java-gradle':
+                                sh './gradlew build -x test 2>/dev/null || gradle build -x test'
+                                break
+                            case ['nodejs', 'react', 'angular']:
+                                sh '''
+                                    if grep -q '"build"' package.json 2>/dev/null; then
+                                        npm run build
+                                    else
+                                        echo "No build script in package.json"
+                                    fi
+                                '''
+                                break
+                            case 'go':
+                                sh 'CGO_ENABLED=0 go build -o "${REPORTS_DIR}/app-binary" ./... 2>/dev/null || go build ./...'
+                                break
+                            case 'dotnet':
+                                sh 'dotnet build --configuration Release && dotnet publish --configuration Release --output "${REPORTS_DIR}/publish"'
+                                break
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 8: Docker Image Build
+        // =====================================================================
+        stage('Docker Image Build') {
+            when {
+                expression {
+                    return (env.HAS_DOCKERFILE == 'true') || (params.IMAGE_NAME?.trim())
+                }
+            }
+            steps {
+                script {
+                    def fullImage = "${REGISTRY}/${params.IMAGE_NAME ?: 'app'}:${params.IMAGE_TAG}"
+                    def dfPath = params.DOCKERFILE_PATH ?: 'Dockerfile'
+                    if (!fileExists(dfPath) && fileExists('Containerfile')) {
+                        dfPath = 'Containerfile'
+                    }
+
+                    if (env.HAS_MAKEFILE == 'true') {
+                        // Try make docker-build first
+                        def makeRc = sh(script: "make docker-build IMAGE=${fullImage} 2>/dev/null", returnStatus: true)
+                        if (makeRc != 0) {
+                            // Fallback to direct build
+                            buildContainer(fullImage, dfPath)
+                        }
+                    } else {
+                        buildContainer(fullImage, dfPath)
+                    }
+
+                    echo """
+╔══════════════════════════════════════════════════════════════╗
+║              Docker Image Built Successfully                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  Image:  ${fullImage.padRight(50)}║
+╚══════════════════════════════════════════════════════════════╝
+                    """
+
+                    env.BUILT_IMAGE = fullImage
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 9: Docker Image Push
+        // =====================================================================
+        stage('Docker Image Push') {
+            when {
+                expression { return env.BUILT_IMAGE?.trim() }
+            }
+            steps {
+                script {
+                    sh """
+                        echo "=== Pushing image: ${env.BUILT_IMAGE} ==="
+                        if command -v podman &>/dev/null; then
+                            podman push "${env.BUILT_IMAGE}" --tls-verify=false
+                        elif command -v docker &>/dev/null; then
+                            docker push "${env.BUILT_IMAGE}"
+                        fi
+                        echo "Push complete: ${env.BUILT_IMAGE}"
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 10: Trivy Image Scan
+        // =====================================================================
+        stage('Trivy Image Scan') {
+            when {
+                expression { params.RUN_TRIVY_SCAN && env.BUILT_IMAGE?.trim() }
+            }
+            steps {
+                script {
+                    sh """
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║        Trivy Container Image Scan                            ║"
+                        echo "╠══════════════════════════════════════════════════════════════╣"
+                        echo "║  Image: ${env.BUILT_IMAGE}"
+                        echo "╚══════════════════════════════════════════════════════════════╝"
+
+                        trivy image --podman-host "" \
+                            --severity "${SCAN_SEVERITY}" \
+                            --format json \
+                            --output "${REPORTS_DIR}/trivy-image-scan.json" \
+                            "${env.BUILT_IMAGE}" || true
+
+                        trivy image --podman-host "" \
+                            --severity "${SCAN_SEVERITY}" \
+                            --format table \
+                            "${env.BUILT_IMAGE}" | tee "${REPORTS_DIR}/trivy-image-scan.txt" || true
+
+                        # Parse and display summary
+                        if [ -f "${REPORTS_DIR}/trivy-image-scan.json" ]; then
+                            python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-image-scan.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+severity_counts = {}
+for r in results:
+    for v in r.get('Vulnerabilities', []):
+        sev = v.get('Severity', 'UNKNOWN')
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+print()
+print('  Image Scan Summary:')
+for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    count = severity_counts.get(sev, 0)
+    marker = '!!' if sev == 'CRITICAL' and count > 0 else ''
+    print(f'    {sev:10s}: {count} {marker}')
+total = sum(severity_counts.values())
+print(f'    {\"TOTAL\":10s}: {total}')
+" 2>/dev/null || true
+                        fi
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 11: SAST — Trivy Filesystem + Secret Detection
+        // =====================================================================
+        stage('SAST & Secret Detection') {
+            when {
+                expression { params.RUN_TRIVY_SCAN || params.RUN_SECRET_DETECTION }
+            }
+            parallel {
+                stage('Trivy FS Scan') {
+                    when { expression { params.RUN_TRIVY_SCAN } }
+                    steps {
+                        sh '''
+                            echo "=== Trivy Filesystem Vulnerability + Misconfig Scan ==="
+                            trivy fs --scanners vuln,misconfig \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format json \
+                                --output "${REPORTS_DIR}/trivy-fs-scan.json" \
+                                "${WORKSPACE}" || true
+
+                            trivy fs --scanners vuln,misconfig \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format table \
+                                "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-fs-scan.txt" || true
+                        '''
+                    }
+                }
+                stage('Secret Detection') {
+                    when { expression { params.RUN_SECRET_DETECTION } }
+                    steps {
+                        sh '''
+                            echo "=== Secret Detection (Trivy) ==="
+                            trivy fs --scanners secret \
+                                --format json \
+                                --output "${REPORTS_DIR}/secret-scan.json" \
+                                "${WORKSPACE}" || true
+
+                            trivy fs --scanners secret \
+                                --format table \
+                                "${WORKSPACE}" | tee "${REPORTS_DIR}/secret-scan.txt" || true
+
+                            if [ -f "${REPORTS_DIR}/secret-scan.json" ]; then
+                                SECRETS=$(python3 -c "
+import json
+with open('${REPORTS_DIR}/secret-scan.json') as f:
+    data = json.load(f)
+count = sum(len(r.get('Secrets', [])) for r in data.get('Results', []))
+print(count)
+" 2>/dev/null || echo "0")
+                                echo "Secrets detected: ${SECRETS}"
+                                if [ "${SECRETS}" -gt 0 ]; then
+                                    echo "WARNING: Hardcoded secrets found!"
+                                fi
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 12: SCA — Dependency Vulnerability Scan
+        // =====================================================================
+        stage('SCA — Dependency Scan') {
+            when {
+                expression { params.RUN_TRIVY_SCAN }
+            }
+            parallel {
+                stage('Trivy SCA') {
+                    steps {
+                        sh '''
+                            echo "=== Trivy SCA / License Scan ==="
+                            trivy fs --scanners vuln,license \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format json \
+                                --output "${REPORTS_DIR}/trivy-sca.json" \
+                                "${WORKSPACE}" || true
+
+                            trivy fs --scanners vuln,license \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format table \
+                                "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-sca.txt" || true
+                        '''
+                    }
+                }
+                stage('OWASP Dependency-Check') {
+                    when { expression { params.RUN_OWASP_CHECK && fileExists('/opt/dependency-check/bin/dependency-check.sh') } }
+                    steps {
+                        sh '''
+                            echo "=== OWASP Dependency-Check ==="
+                            /opt/dependency-check/bin/dependency-check.sh \
+                                --project "${JOB_NAME}" \
+                                --scan "${WORKSPACE}" \
+                                --format HTML --format JSON \
+                                --out "${REPORTS_DIR}" \
+                                --failOnCVSS 7 \
+                                --enableExperimental || true
+                        '''
+                    }
+                }
+                stage('Grype Scan') {
+                    when { expression { params.RUN_GRYPE && sh(script: 'command -v grype', returnStatus: true) == 0 } }
+                    steps {
+                        sh '''
+                            echo "=== Grype — Vulnerability Scan ==="
+                            grype dir:"${WORKSPACE}" \
+                                --output json \
+                                --file "${REPORTS_DIR}/grype-sca.json" || true
+                            grype dir:"${WORKSPACE}" \
+                                --output table | tee "${REPORTS_DIR}/grype-sca.txt" || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 13: Dockerfile Lint (Hadolint)
+        // =====================================================================
+        stage('Dockerfile Lint') {
+            when {
+                expression { params.RUN_DOCKERFILE_LINT && (env.HAS_DOCKERFILE == 'true') }
+            }
+            steps {
+                sh '''
+                    DFILE="Dockerfile"
+                    [ -f "Containerfile" ] && DFILE="Containerfile"
+                    echo "=== Hadolint — Dockerfile Best Practices ==="
+                    if command -v hadolint &>/dev/null; then
+                        hadolint --format json "$DFILE" > "${REPORTS_DIR}/hadolint.json" 2>/dev/null || true
+                        hadolint "$DFILE" | tee "${REPORTS_DIR}/hadolint.txt" || true
+
+                        ISSUES=$(cat "${REPORTS_DIR}/hadolint.json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+                        echo "Hadolint issues: ${ISSUES}"
+                    else
+                        echo "Hadolint not installed, running Trivy config scan on Dockerfile..."
+                        trivy config --severity "${SCAN_SEVERITY}" --format table "$DFILE" || true
+                    fi
+                '''
+            }
+        }
+
+        // =====================================================================
+        // STAGE 14: ShellCheck (Shell Script Analysis)
+        // =====================================================================
+        stage('ShellCheck') {
+            when {
+                expression { return sh(script: 'find "${WORKSPACE}" -name "*.sh" -not -path "*/.trivy-cache/*" | head -1', returnStdout: true).trim() }
+            }
+            steps {
+                sh '''
+                    echo "=== ShellCheck — Shell Script Analysis ==="
+                    if command -v shellcheck &>/dev/null; then
+                        find "${WORKSPACE}" -name "*.sh" -type f \
+                            ! -path "*/node_modules/*" \
+                            ! -path "*/.trivy-cache/*" \
+                            -exec shellcheck --format=json {} + \
+                            > "${REPORTS_DIR}/shellcheck.json" 2>/dev/null || true
+                        find "${WORKSPACE}" -name "*.sh" -type f \
+                            ! -path "*/node_modules/*" \
+                            ! -path "*/.trivy-cache/*" \
+                            -exec shellcheck {} + \
+                            2>&1 | tee "${REPORTS_DIR}/shellcheck.txt" || true
+                    else
+                        echo "ShellCheck not installed, skipping"
+                    fi
+                '''
+            }
+        }
+
+        // =====================================================================
+        // STAGE 15: K8s Deployment Manifest Security Scan
+        // =====================================================================
+        stage('K8s Manifest Security Scan') {
+            when {
+                expression { params.RUN_K8S_MANIFEST_SCAN && env.HAS_K8S_MANIFESTS == 'true' }
+            }
+            parallel {
+                stage('Trivy K8s Config') {
+                    steps {
+                        sh '''
+                            MANIFESTS_DIR="${WORKSPACE}/${K8S_MANIFESTS_DIR:-cat-deployments}"
+                            echo "=== Trivy K8s Manifest Misconfiguration Scan ==="
+                            echo "Scanning: ${MANIFESTS_DIR}"
+
+                            trivy config \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format json \
+                                --output "${REPORTS_DIR}/trivy-k8s-config.json" \
+                                "${MANIFESTS_DIR}" || true
+
+                            trivy config \
+                                --severity "${SCAN_SEVERITY}" \
+                                --format table \
+                                "${MANIFESTS_DIR}" | tee "${REPORTS_DIR}/trivy-k8s-config.txt" || true
+
+                            # Summary
+                            if [ -f "${REPORTS_DIR}/trivy-k8s-config.json" ]; then
+                                python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-k8s-config.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+misconfigs = {}
+for r in results:
+    for m in r.get('Misconfigurations', []):
+        sev = m.get('Severity', 'UNKNOWN')
+        misconfigs[sev] = misconfigs.get(sev, 0) + 1
+print()
+print('  K8s Manifest Scan Summary:')
+for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    print(f'    {sev:10s}: {misconfigs.get(sev, 0)}')
+total = sum(misconfigs.values())
+print(f'    {\"TOTAL\":10s}: {total}')
+" 2>/dev/null || true
+                            fi
+                        '''
+                    }
+                }
+                stage('Kubesec Scan') {
+                    when { expression { return sh(script: 'command -v kubesec', returnStatus: true) == 0 } }
+                    steps {
+                        sh '''
+                            MANIFESTS_DIR="${WORKSPACE}/${K8S_MANIFESTS_DIR:-cat-deployments}"
+                            echo "=== Kubesec — K8s Resource Risk Assessment ==="
+                            > "${REPORTS_DIR}/kubesec-results.json"
+
+                            find "${MANIFESTS_DIR}" \\( -name "*deployment*" -o -name "*pod*" -o -name "*statefulset*" \\) \
+                                \\( -name "*.yml" -o -name "*.yaml" \\) | while read f; do
+                                echo "--- Scanning: $(basename $f) ---"
+                                kubesec scan "$f" >> "${REPORTS_DIR}/kubesec-results.json" 2>/dev/null || true
+                            done
+
+                            echo ""
+                            echo "Kubesec results saved to: ${REPORTS_DIR}/kubesec-results.json"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 16: Security Gate — Pass / Fail
+        // =====================================================================
+        stage('Security Gate') {
+            steps {
+                script {
+                    echo "=== Evaluating Security Gate ==="
+                    def gateResult = sh(script: '''
+                        CRITICAL_COUNT=0
+                        HIGH_COUNT=0
+                        SECRETS_COUNT=0
+                        MISCONFIG_COUNT=0
+
+                        # Parse all Trivy JSON reports
+                        for REPORT in "${REPORTS_DIR}"/trivy-*.json; do
+                            [ -f "${REPORT}" ] || continue
+                            COUNTS=$(python3 -c "
+import json
+with open('${REPORT}') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+crit = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
+high = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'HIGH')
+misc = sum(1 for r in results for m in r.get('Misconfigurations', []) if m.get('Severity') in ('CRITICAL', 'HIGH'))
+print(f'{crit} {high} {misc}')
+" 2>/dev/null || echo "0 0 0")
+                            C=$(echo "$COUNTS" | awk '{print $1}')
+                            H=$(echo "$COUNTS" | awk '{print $2}')
+                            M=$(echo "$COUNTS" | awk '{print $3}')
+                            CRITICAL_COUNT=$((CRITICAL_COUNT + C))
+                            HIGH_COUNT=$((HIGH_COUNT + H))
+                            MISCONFIG_COUNT=$((MISCONFIG_COUNT + M))
+                        done
+
+                        # Count secrets
+                        if [ -f "${REPORTS_DIR}/secret-scan.json" ]; then
+                            SECRETS_COUNT=$(python3 -c "
+import json
+with open('${REPORTS_DIR}/secret-scan.json') as f:
+    data = json.load(f)
+print(sum(len(r.get('Secrets', [])) for r in data.get('Results', [])))
+" 2>/dev/null || echo "0")
+                        fi
+
+                        # Save gate results for final report
+                        cat > "${REPORTS_DIR}/gate-results.txt" <<EOF
+CRITICAL_VULNS=${CRITICAL_COUNT}
+HIGH_VULNS=${HIGH_COUNT}
+SECRETS=${SECRETS_COUNT}
+MISCONFIGS=${MISCONFIG_COUNT}
+EOF
+
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║              SECURITY GATE RESULTS                           ║"
+                        echo "╠══════════════════════════════════════════════════════════════╣"
+                        printf "║  CRITICAL vulnerabilities:   %-30s║\\n" "${CRITICAL_COUNT}"
+                        printf "║  HIGH vulnerabilities:       %-30s║\\n" "${HIGH_COUNT}"
+                        printf "║  Secrets detected:           %-30s║\\n" "${SECRETS_COUNT}"
+                        printf "║  Misconfigurations:          %-30s║\\n" "${MISCONFIG_COUNT}"
+                        echo "╠══════════════════════════════════════════════════════════════╣"
+
+                        if [ "${CRITICAL_COUNT}" -gt 0 ] || [ "${SECRETS_COUNT}" -gt 0 ]; then
+                            echo "║  GATE STATUS:  FAIL                                         ║"
+                            echo "╚══════════════════════════════════════════════════════════════╝"
+                            exit 1
+                        else
+                            echo "║  GATE STATUS:  PASS                                         ║"
+                            echo "╚══════════════════════════════════════════════════════════════╝"
+                            exit 0
+                        fi
+                    ''', returnStatus: true)
+
+                    if (gateResult != 0 && params.FAIL_ON_CRITICAL) {
+                        unstable('CRITICAL vulnerabilities or secrets detected — marking UNSTABLE')
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 17: Deploy to Kubernetes (optional)
+        // =====================================================================
+        stage('Deploy to K8s') {
+            when { expression { params.DEPLOY_TO_K8S && env.BUILT_IMAGE?.trim() } }
+            steps {
+                script {
+                    def namespace = params.K8S_NAMESPACE ?: params.IMAGE_NAME
+                    sh """
+                        echo "=== Deploying to Kubernetes ==="
+                        echo "  Image:     ${env.BUILT_IMAGE}"
+                        echo "  Namespace: ${namespace}"
+
+                        kubectl set image deployment/${params.IMAGE_NAME} \
+                            ${params.IMAGE_NAME}=${env.BUILT_IMAGE} \
+                            -n ${namespace} 2>/dev/null || echo "set image failed"
+
+                        kubectl rollout status deployment/${params.IMAGE_NAME} \
+                            -n ${namespace} --timeout=300s 2>/dev/null || echo "rollout status check failed"
+
+                        kubectl get pods -n ${namespace} -l app=${params.IMAGE_NAME} 2>/dev/null || true
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 18: Final Consolidated Terminal Report
+        // =====================================================================
+        stage('Final Report') {
+            steps {
+                sh '''
+                    PIPELINE_END=$(date +%s)
+                    DURATION=$((PIPELINE_END - ${PIPELINE_START:-0}))
+                    DURATION_MIN=$((DURATION / 60))
+                    DURATION_SEC=$((DURATION % 60))
+
+                    echo ""
+                    echo ""
+                    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+                    echo "║                                                                              ║"
+                    echo "║         DevSecOps Pipeline — FINAL CONSOLIDATED REPORT                        ║"
+                    echo "║                                                                              ║"
+                    echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+                    echo "║  Pipeline:   ${JOB_NAME:-devsecops-pipeline}"
+                    echo "║  Build:      #${BUILD_NUMBER:-0}"
+                    echo "║  Date:       $(date '+%Y-%m-%d %H:%M:%S')"
+                    echo "║  Duration:   ${DURATION_MIN}m ${DURATION_SEC}s"
+                    echo "║  Language:   ${DETECTED_LANG:-unknown}"
+                    echo "║  Image:      ${BUILT_IMAGE:-N/A}"
+                    echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+                    echo "║                                                                              ║"
+                    echo "║  STAGE RESULTS                                                               ║"
+                    echo "║  ────────────────────────────────────────────────────────────────────────────  ║"
+
+                    # ──────────────────────────────────────────────
+                    # 1. Unit Test Results
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [1] UNIT TESTING"
+
+                    if [ -f "${REPORTS_DIR}/pytest-results.xml" ]; then
+                        python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/pytest-results.xml')
+root = tree.getroot()
+tests   = int(root.attrib.get('tests', 0))
+errors  = int(root.attrib.get('errors', 0))
+failures= int(root.attrib.get('failures', 0))
+skipped = int(root.attrib.get('skipped', 0))
+time_s  = float(root.attrib.get('time', 0))
+passed  = tests - errors - failures - skipped
+status  = 'PASS' if failures == 0 and errors == 0 else 'FAIL'
+print(f'║      Framework:       pytest')
+print(f'║      Status:          {status}')
+print(f'║      Total:           {tests}')
+print(f'║      Passed:          {passed}')
+print(f'║      Failed:          {failures}')
+print(f'║      Errors:          {errors}')
+print(f'║      Skipped:         {skipped}')
+print(f'║      Duration:        {time_s:.2f}s')
+" 2>/dev/null || echo "║      (Unable to parse pytest results)"
+                    elif [ -f "${REPORTS_DIR}/go-test-results.json" ]; then
+                        echo "║      Framework:       go test"
+                        echo "║      Results:         See go-test-results.json"
+                    elif [ -f "${REPORTS_DIR}/test-results.trx" ]; then
+                        echo "║      Framework:       dotnet test"
+                        echo "║      Results:         See test-results.trx"
+                    else
+                        echo "║      Status:          SKIPPED or NO RESULTS"
+                    fi
+
+                    # Coverage
+                    if [ -f "${REPORTS_DIR}/coverage.xml" ]; then
+                        python3 -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('${REPORTS_DIR}/coverage.xml')
+root = tree.getroot()
+rate  = float(root.attrib.get('line-rate', 0)) * 100
+lines = root.attrib.get('lines-valid', '?')
+covered = root.attrib.get('lines-covered', '?')
+threshold = float('${COVERAGE_THRESHOLD}')
+gate = 'PASS' if rate >= threshold else 'FAIL'
+print(f'║      Coverage:        {rate:.1f}%  ({covered}/{lines} lines)')
+print(f'║      Threshold:       {threshold}%')
+print(f'║      Coverage Gate:   {gate}')
+" 2>/dev/null || true
+                    elif [ -f "${REPORTS_DIR}/go-coverage.out" ]; then
+                        COV=$(go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | tail -1 | grep -oP '[0-9.]+(?=%)' || echo "?")
+                        echo "║      Coverage:        ${COV}%"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 2. Code Quality
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [2] CODE QUALITY"
+
+                    if [ -f "${REPORTS_DIR}/flake8-report.txt" ]; then
+                        FLAKE8_ISSUES=$(wc -l < "${REPORTS_DIR}/flake8-report.txt" 2>/dev/null || echo "0")
+                        echo "║      Flake8 Issues:   ${FLAKE8_ISSUES}"
+                    fi
+                    if [ -f "${REPORTS_DIR}/pylint-report.txt" ]; then
+                        PYLINT_SCORE=$(grep -oP 'Your code has been rated at \K[0-9.]+' "${REPORTS_DIR}/pylint-report.txt" 2>/dev/null || echo "N/A")
+                        echo "║      Pylint Score:    ${PYLINT_SCORE}/10"
+                    fi
+                    if [ -f "${REPORTS_DIR}/bandit-report.json" ]; then
+                        BANDIT=$(python3 -c "
+import json
+with open('${REPORTS_DIR}/bandit-report.json') as f:
+    data = json.load(f)
+results = data.get('results', [])
+high = sum(1 for r in results if r.get('issue_severity') == 'HIGH')
+med  = sum(1 for r in results if r.get('issue_severity') == 'MEDIUM')
+low  = sum(1 for r in results if r.get('issue_severity') == 'LOW')
+print(f'H:{high} M:{med} L:{low}')
+" 2>/dev/null || echo "N/A")
+                        echo "║      Bandit Issues:   ${BANDIT}"
+                    fi
+                    if [ -f "${REPORTS_DIR}/eslint-report.json" ]; then
+                        echo "║      ESLint:          See eslint-report.json"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 3. Docker Build
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [3] DOCKER BUILD"
+                    if [ -n "${BUILT_IMAGE}" ]; then
+                        echo "║      Status:          BUILT"
+                        echo "║      Image:           ${BUILT_IMAGE}"
+                    else
+                        echo "║      Status:          SKIPPED (no Dockerfile)"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 4. Trivy Image Scan
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [4] TRIVY IMAGE SCAN"
+                    if [ -f "${REPORTS_DIR}/trivy-image-scan.json" ]; then
+                        python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-image-scan.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+sev = {}
+for r in results:
+    for v in r.get('Vulnerabilities', []):
+        s = v.get('Severity', 'UNKNOWN')
+        sev[s] = sev.get(s, 0) + 1
+for s in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    cnt = sev.get(s, 0)
+    print(f'║      {s:10s}:     {cnt}')
+total = sum(sev.values())
+print(f'║      Total:           {total}')
+" 2>/dev/null || echo "║      (Unable to parse results)"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 5. SAST / Filesystem Scan
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [5] SAST — FILESYSTEM SCAN"
+                    if [ -f "${REPORTS_DIR}/trivy-fs-scan.json" ]; then
+                        python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-fs-scan.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+vulns = {}
+misconfigs = {}
+for r in results:
+    for v in r.get('Vulnerabilities', []):
+        s = v.get('Severity', 'UNKNOWN')
+        vulns[s] = vulns.get(s, 0) + 1
+    for m in r.get('Misconfigurations', []):
+        s = m.get('Severity', 'UNKNOWN')
+        misconfigs[s] = misconfigs.get(s, 0) + 1
+print('║      Vulnerabilities:')
+for s in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    print(f'║        {s:10s}:   {vulns.get(s, 0)}')
+print(f'║      Misconfigurations:')
+for s in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    print(f'║        {s:10s}:   {misconfigs.get(s, 0)}')
+" 2>/dev/null || echo "║      (Unable to parse results)"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 6. Secret Detection
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [6] SECRET DETECTION"
+                    if [ -f "${REPORTS_DIR}/secret-scan.json" ]; then
+                        python3 -c "
+import json
+with open('${REPORTS_DIR}/secret-scan.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+count = sum(len(r.get('Secrets', [])) for r in results)
+status = 'PASS (no secrets found)' if count == 0 else f'FAIL ({count} secrets detected!)'
+print(f'║      Status:          {status}')
+" 2>/dev/null || echo "║      (Unable to parse results)"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 7. SCA / Dependency Scan
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [7] SCA — DEPENDENCY SCAN"
+                    if [ -f "${REPORTS_DIR}/trivy-sca.json" ]; then
+                        python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-sca.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+sev = {}
+for r in results:
+    for v in r.get('Vulnerabilities', []):
+        s = v.get('Severity', 'UNKNOWN')
+        sev[s] = sev.get(s, 0) + 1
+for s in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    print(f'║      {s:10s}:     {sev.get(s, 0)}')
+" 2>/dev/null || echo "║      (Unable to parse results)"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    if [ -f "${REPORTS_DIR}/grype-sca.json" ]; then
+                        echo "║      Grype:           See grype-sca.json"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 8. Dockerfile Lint
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [8] DOCKERFILE LINT"
+                    if [ -f "${REPORTS_DIR}/hadolint.json" ]; then
+                        ISSUES=$(python3 -c "import json; print(len(json.load(open('${REPORTS_DIR}/hadolint.json'))))" 2>/dev/null || echo "?")
+                        echo "║      Hadolint Issues: ${ISSUES}"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 9. K8s Manifest Scan
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [9] K8S DEPLOYMENT MANIFEST SCAN"
+                    if [ -f "${REPORTS_DIR}/trivy-k8s-config.json" ]; then
+                        python3 -c "
+import json
+with open('${REPORTS_DIR}/trivy-k8s-config.json') as f:
+    data = json.load(f)
+results = data.get('Results', [])
+misconfigs = {}
+for r in results:
+    for m in r.get('Misconfigurations', []):
+        s = m.get('Severity', 'UNKNOWN')
+        misconfigs[s] = misconfigs.get(s, 0) + 1
+for s in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+    print(f'║      {s:10s}:     {misconfigs.get(s, 0)}')
+total = sum(misconfigs.values())
+print(f'║      Total:           {total}')
+# List affected files
+files = set()
+for r in results:
+    t = r.get('Target', '')
+    if r.get('Misconfigurations'):
+        files.add(t)
+if files:
+    print('║      Affected files:')
+    for f in sorted(files)[:10]:
+        print(f'║        - {f}')
+" 2>/dev/null || echo "║      (Unable to parse results)"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    if [ -f "${REPORTS_DIR}/kubesec-results.json" ]; then
+                        echo "║      Kubesec:         See kubesec-results.json"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # 10. ShellCheck
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "║  [10] SHELLCHECK"
+                    if [ -f "${REPORTS_DIR}/shellcheck.json" ]; then
+                        SC_ISSUES=$(python3 -c "import json; print(len(json.load(open('${REPORTS_DIR}/shellcheck.json'))))" 2>/dev/null || echo "?")
+                        echo "║      Issues:          ${SC_ISSUES}"
+                    else
+                        echo "║      Status:          SKIPPED"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # SECURITY GATE
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+                    echo "║                                                                              ║"
+                    echo "║  SECURITY GATE SUMMARY                                                       ║"
+                    echo "║  ────────────────────────────────────────────────────────────────────────────  ║"
+
+                    if [ -f "${REPORTS_DIR}/gate-results.txt" ]; then
+                        . "${REPORTS_DIR}/gate-results.txt"
+                        printf "║      Critical Vulns:    %-50s║\\n" "${CRITICAL_VULNS:-0}"
+                        printf "║      High Vulns:        %-50s║\\n" "${HIGH_VULNS:-0}"
+                        printf "║      Secrets Detected:  %-50s║\\n" "${SECRETS:-0}"
+                        printf "║      Misconfigs:        %-50s║\\n" "${MISCONFIGS:-0}"
+
+                        TOTAL_CRITICAL=$((${CRITICAL_VULNS:-0} + 0))
+                        TOTAL_SECRETS=$((${SECRETS:-0} + 0))
+
+                        if [ "${TOTAL_CRITICAL}" -gt 0 ] || [ "${TOTAL_SECRETS}" -gt 0 ]; then
+                            echo "║                                                                              ║"
+                            echo "║      OVERALL STATUS:   FAIL                                                  ║"
+                        else
+                            echo "║                                                                              ║"
+                            echo "║      OVERALL STATUS:   PASS                                                  ║"
+                        fi
+                    else
+                        echo "║      (No security gate data available)"
+                    fi
+
+                    # ──────────────────────────────────────────────
+                    # Report Files
+                    # ──────────────────────────────────────────────
+                    echo "║                                                                              ║"
+                    echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+                    echo "║                                                                              ║"
+                    echo "║  REPORT FILES                                                                ║"
+                    echo "║  ────────────────────────────────────────────────────────────────────────────  ║"
+
+                    for f in "${REPORTS_DIR}"/*; do
+                        [ -f "$f" ] || continue
+                        SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)
+                        BASENAME=$(basename "$f")
+                        printf "║    %-45s %8s\\n" "${BASENAME}" "${SIZE}"
+                    done
+
+                    echo "║                                                                              ║"
+                    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+                    echo ""
+                '''
+            }
+        }
+    }
+
+    // =========================================================================
+    // Post Actions
+    // =========================================================================
+    post {
+        always {
+            archiveArtifacts artifacts: 'pipeline-reports/**/*', allowEmptyArchive: true
+
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'pipeline-reports',
+                reportFiles: 'pytest-report.html,security-report.html',
+                reportName: 'DevSecOps Reports'
+            ])
+
+            junit allowEmptyResults: true, testResults: 'pipeline-reports/**/*.xml'
+        }
+        success {
+            echo 'DevSecOps Pipeline PASSED'
+        }
+        unstable {
+            echo 'DevSecOps Pipeline completed with WARNINGS — review the Final Report above'
+        }
+        failure {
+            echo 'DevSecOps Pipeline FAILED — critical issues detected'
+        }
+        cleanup {
+            cleanWs(deleteDirs: true, patterns: [
+                [pattern: '.trivy-cache/**', type: 'INCLUDE'],
+                [pattern: 'node_modules/**', type: 'INCLUDE']
+            ])
+        }
+    }
+}
+
+// =============================================================================
+// Helper: Auto-detect project language
+// =============================================================================
+def detectLanguage() {
+    if (fileExists('requirements.txt') || fileExists('setup.py') || fileExists('pyproject.toml') || fileExists('Pipfile')) {
+        echo "Detected: Python"; return 'python'
+    }
+    if (fileExists('pom.xml')) {
+        echo "Detected: Java (Maven)"; return 'java-maven'
+    }
+    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
+        echo "Detected: Java (Gradle)"; return 'java-gradle'
+    }
+    if (fileExists('angular.json')) {
+        echo "Detected: Angular"; return 'angular'
+    }
+    if (fileExists('package.json')) {
+        def pkgJson = readFile('package.json')
+        if (pkgJson.contains('"react"')) { echo "Detected: React"; return 'react' }
+        echo "Detected: Node.js"; return 'nodejs'
+    }
+    if (fileExists('go.mod')) {
+        echo "Detected: Go"; return 'go'
+    }
+    if (sh(script: 'find . -maxdepth 2 -name "*.csproj" | head -1', returnStdout: true).trim()) {
+        echo "Detected: .NET"; return 'dotnet'
+    }
+    echo "Could not auto-detect — defaulting to python"
+    return 'python'
+}
+
+// =============================================================================
+// Helper: Build container image with podman or docker
+// =============================================================================
+def buildContainer(String fullImage, String dfPath) {
+    sh """
+        echo "=== Building: ${fullImage} ==="
+        if command -v podman &>/dev/null; then
+            podman build -t "${fullImage}" -f "${dfPath}" .
+        elif command -v docker &>/dev/null; then
+            docker build -t "${fullImage}" -f "${dfPath}" .
+        else
+            echo "ERROR: Neither podman nor docker found"
+            exit 1
+        fi
+    """
+}

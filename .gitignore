@@ -22,3 +22,4 @@ remoting/
 *.tmp
 *.bak
 *.log
+.scannerwork/

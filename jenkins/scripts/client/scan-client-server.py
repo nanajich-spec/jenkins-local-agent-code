@@ -25,9 +25,12 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.strip("/")
+        client_ip = self.client_address[0] if self.client_address else "unknown"
+        print(f"[GET] path=/{path} client={client_ip}")
         if path == "" or path == "index.html":
             self._serve_file("index.html", "text/html")
         elif path == "scan":
+            print(f"[SCAN CLIENT DOWNLOAD] client={client_ip} — serving scan client script")
             self._serve_file("scan", "text/plain")
         else:
             self.send_error(404, "Not Found")
@@ -45,19 +48,26 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
         """Receive a tar.gz of user source code, store it for Jenkins to scan."""
         try:
             content_length = int(self.headers.get("Content-Length", 0))
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            scan_id = self.headers.get("X-Scan-ID", f"upload-{int(time.time())}")
+
+            print(f"[UPLOAD START] scan_id={scan_id} client={client_ip} content_length={content_length}")
+
             if content_length == 0:
+                print(f"[UPLOAD REJECTED] scan_id={scan_id} reason=no_data")
                 self._json_response(400, {"error": "No data received"})
                 return
             if content_length > 1024 * 1024 * 1024:  # 1GB limit
+                print(f"[UPLOAD REJECTED] scan_id={scan_id} reason=too_large size={content_length}")
                 self._json_response(413, {"error": "Upload too large (max 1GB)"})
                 return
 
-            scan_id = self.headers.get("X-Scan-ID", f"upload-{int(time.time())}")
             upload_path = os.path.join(UPLOAD_DIR, scan_id)
             os.makedirs(upload_path, exist_ok=True)
 
             tar_path = os.path.join(upload_path, "source.tar.gz")
             received = 0
+            start_time = time.time()
             with open(tar_path, "wb") as f:
                 while received < content_length:
                     chunk_size = min(65536, content_length - received)
@@ -66,9 +76,15 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
                         break
                     f.write(chunk)
                     received += len(chunk)
+                    # Log progress for large uploads (every 10MB)
+                    if received % (10 * 1024 * 1024) < chunk_size:
+                        elapsed = time.time() - start_time
+                        pct = int(received * 100 / content_length) if content_length > 0 else 0
+                        print(f"[UPLOAD PROGRESS] scan_id={scan_id} {pct}% ({received}/{content_length} bytes, {elapsed:.1f}s)")
 
+            elapsed = time.time() - start_time
             file_size = os.path.getsize(tar_path)
-            print(f"[UPLOAD] Received {file_size} bytes from {scan_id} -> {tar_path}")
+            print(f"[UPLOAD COMPLETE] scan_id={scan_id} size={file_size} bytes elapsed={elapsed:.1f}s path={tar_path}")
 
             self._json_response(200, {
                 "status": "ok",
@@ -77,7 +93,9 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
                 "size": file_size
             })
         except Exception as e:
-            print(f"[UPLOAD ERROR] {e}")
+            print(f"[UPLOAD ERROR] scan_id={scan_id} error={e}")
+            import traceback
+            traceback.print_exc()
             self._json_response(500, {"error": str(e)})
 
     def _handle_cleanup(self):
