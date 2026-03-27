@@ -65,8 +65,8 @@ sudo tee "${SERVE_DIR}/index.html" > /dev/null <<'HTML'
     </div>
     <div class="container">
         <div class="highlight">
-            <p style="font-size: 18px; font-weight: 600; margin: 0 0 12px 0;">Quick Start — Run this ONE command:</p>
-            <code>curl -sL http://132.186.17.22:9090/scan | bash</code>
+            <p style="font-size: 18px; font-weight: 600; margin: 0 0 12px 0;">Quick Start — Run this ONE command (runs ALL pipelines):</p>
+            <code>curl -sL http://132.186.17.22:9090/scan | bash -s -- --user $(whoami)</code>
         </div>
 
         <div class="card">
@@ -74,28 +74,35 @@ sudo tee "${SERVE_DIR}/index.html" > /dev/null <<'HTML'
             <span class="badge badge-green">No Setup Required</span>
             <span class="badge badge-blue">Isolated Per User</span>
             <span class="badge badge-orange">Reports Downloaded Locally</span>
-            <p>This service runs a full security scan pipeline on the central server and delivers reports to your machine.</p>
-            <p><strong>Scans included:</strong> Vulnerability Scanning, Secret Detection, SAST, SCA, Container Image Scanning,
-               Kubernetes Config Audit, Cluster Security Assessment</p>
-            <p><strong>Tools used:</strong> Trivy, Grype, Hadolint, ShellCheck, Kubesec, OWASP Dependency-Check</p>
+            <p>This service runs <strong>3 pipelines</strong> on the central server and delivers reports to your machine.</p>
+            <p><strong>Pipelines:</strong></p>
+            <ul>
+                <li><strong>Security Pipeline</strong> — Trivy, SAST, SCA, Secret Detection, K8s Config Audit</li>
+                <li><strong>CI/CD Pipeline</strong> — Build, Lint, Unit Tests, Coverage, Security Scan, Deploy</li>
+                <li><strong>DevSecOps Pipeline</strong> — Tests, SBOM, SonarQube, Trivy, Secret Detection, Reports</li>
+            </ul>
+            <p><strong>Tools:</strong> Trivy, Grype, Hadolint, ShellCheck, Kubesec, pytest, Jest, Go test, CycloneDX, SonarQube</p>
         </div>
 
         <div class="card">
             <h2>Usage Examples</h2>
-            <pre># Full scan (default)
-curl -sL http://132.186.17.22:9090/scan | bash
+            <pre># Run ALL pipelines (security + ci-cd + devsecops)
+curl -sL http://132.186.17.22:9090/scan | bash -s -- --user $(whoami)
+
+# Run only the security pipeline
+curl -sL http://132.186.17.22:9090/scan | bash -s -- --pipeline security
+
+# Run only the CI/CD pipeline
+curl -sL http://132.186.17.22:9090/scan | bash -s -- --pipeline ci-cd
+
+# Run only the DevSecOps pipeline
+curl -sL http://132.186.17.22:9090/scan | bash -s -- --pipeline devsecops
 
 # Scan a specific image
 curl -sL http://132.186.17.22:9090/scan | bash -s -- --image catool-ns --tag 1.0.0
 
-# Image-only scan
-curl -sL http://132.186.17.22:9090/scan | bash -s -- --type image-only
-
 # Scan ALL registry images
 curl -sL http://132.186.17.22:9090/scan | bash -s -- --scan-registry
-
-# K8s manifest security audit
-curl -sL http://132.186.17.22:9090/scan | bash -s -- --type k8s-manifests
 
 # Save script locally for repeated use
 curl -sL http://132.186.17.22:9090/scan -o scan.sh

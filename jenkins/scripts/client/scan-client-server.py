@@ -16,6 +16,7 @@ import shutil
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9090
 SERVE_DIR = "/opt/scan-client-server"
 UPLOAD_DIR = "/opt/scan-uploads"
+DYNAMIC_AGENT_SCRIPT = "/tmp/jenkins-local-agent-code/jenkins/scripts/dynamic-agent-manager.sh"
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -41,6 +42,12 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
             self._handle_upload()
         elif path == "cleanup":
             self._handle_cleanup()
+        elif path == "agent/create":
+            self._handle_agent_create()
+        elif path == "agent/destroy":
+            self._handle_agent_destroy()
+        elif path == "agent/status":
+            self._handle_agent_status()
         else:
             self.send_error(404, "Not Found")
 
@@ -96,6 +103,110 @@ class ScanClientHandler(http.server.BaseHTTPRequestHandler):
             print(f"[UPLOAD ERROR] scan_id={scan_id} error={e}")
             import traceback
             traceback.print_exc()
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_agent_create(self):
+        """Create a dynamic JNLP agent for a scan."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode() if content_length > 0 else "{}"
+            data = json.loads(body)
+            scan_id = data.get("scan_id", "")
+            if not scan_id:
+                self._json_response(400, {"error": "scan_id is required"})
+                return
+
+            print(f"[AGENT CREATE] scan_id={scan_id}")
+            import subprocess
+            result = subprocess.run(
+                [DYNAMIC_AGENT_SCRIPT, "create", scan_id],
+                capture_output=True, text=True, timeout=120
+            )
+            # Extract agent name from scan_id (same logic as the bash script)
+            import re
+            epoch_match = re.search(r'(\d{8,})$', scan_id)
+            short_id = epoch_match.group(1) if epoch_match else scan_id[:12]
+            agent_name = f"scan-agent-{short_id}"
+
+            if result.returncode == 0:
+                print(f"[AGENT CREATE OK] scan_id={scan_id} agent={agent_name}")
+                self._json_response(200, {
+                    "status": "ok",
+                    "agent_name": agent_name,
+                    "agent_label": agent_name,
+                    "scan_id": scan_id,
+                    "output": result.stdout[-500:] if len(result.stdout) > 500 else result.stdout
+                })
+            else:
+                print(f"[AGENT CREATE FAIL] scan_id={scan_id} rc={result.returncode}")
+                print(f"  stdout: {result.stdout[-300:]}")
+                print(f"  stderr: {result.stderr[-300:]}")
+                self._json_response(500, {
+                    "error": "Agent creation failed",
+                    "returncode": result.returncode,
+                    "output": result.stdout[-500:] if len(result.stdout) > 500 else result.stdout,
+                    "stderr": result.stderr[-300:] if len(result.stderr) > 300 else result.stderr
+                })
+        except subprocess.TimeoutExpired:
+            print(f"[AGENT CREATE TIMEOUT] scan_id={scan_id}")
+            self._json_response(504, {"error": "Agent creation timed out (120s)"})
+        except Exception as e:
+            print(f"[AGENT CREATE ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_agent_destroy(self):
+        """Destroy a dynamic JNLP agent after scan completes."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode() if content_length > 0 else "{}"
+            data = json.loads(body)
+            scan_id = data.get("scan_id", "")
+            if not scan_id:
+                self._json_response(400, {"error": "scan_id is required"})
+                return
+
+            print(f"[AGENT DESTROY] scan_id={scan_id}")
+            import subprocess
+            result = subprocess.run(
+                [DYNAMIC_AGENT_SCRIPT, "destroy", scan_id],
+                capture_output=True, text=True, timeout=30
+            )
+            print(f"[AGENT DESTROY] rc={result.returncode}")
+            self._json_response(200, {
+                "status": "destroyed",
+                "scan_id": scan_id,
+                "output": result.stdout[-300:] if len(result.stdout) > 300 else result.stdout
+            })
+        except Exception as e:
+            print(f"[AGENT DESTROY ERROR] {e}")
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_agent_status(self):
+        """Check status of a dynamic agent."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode() if content_length > 0 else "{}"
+            data = json.loads(body)
+            scan_id = data.get("scan_id", "")
+
+            import subprocess
+            if scan_id:
+                result = subprocess.run(
+                    [DYNAMIC_AGENT_SCRIPT, "status", scan_id],
+                    capture_output=True, text=True, timeout=10
+                )
+            else:
+                result = subprocess.run(
+                    [DYNAMIC_AGENT_SCRIPT, "list"],
+                    capture_output=True, text=True, timeout=10
+                )
+            self._json_response(200, {
+                "status": "ok",
+                "output": result.stdout
+            })
+        except Exception as e:
             self._json_response(500, {"error": str(e)})
 
     def _handle_cleanup(self):
