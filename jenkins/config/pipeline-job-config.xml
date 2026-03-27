@@ -53,12 +53,22 @@
           <defaultValue>132.186.17.22:5000</defaultValue>
           <description>Container registry URL</description>
         </hudson.model.StringParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>AGENT_LABEL</name>
+          <defaultValue>local-security-agent</defaultValue>
+          <description>Jenkins agent label (set by client for dynamic agents)</description>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.BooleanParameterDefinition>
+          <name>GENERATE_SBOM</name>
+          <defaultValue>true</defaultValue>
+          <description>Generate CycloneDX SBOM during scan</description>
+        </hudson.model.BooleanParameterDefinition>
       </parameterDefinitions>
     </hudson.model.ParametersDefinitionProperty>
   </properties>
   <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps">
     <script><![CDATA[pipeline {
-    agent { label 'local-security-agent' }
+    agent { label "${params.AGENT_LABEL ?: 'local-security-agent'}" }
     options {
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timeout(time: 60, unit: 'MINUTES')
@@ -187,6 +197,31 @@
                                 trivy image --podman-host '' --severity CRITICAL,HIGH --format table "${registry}/\$REPO:\$TAG" || true
                             done
                         done
+                    """
+                }
+            }
+        }
+        stage('CycloneDX SBOM Generation') {
+            when { expression { return params.GENERATE_SBOM } }
+            steps {
+                script {
+                    echo '=== CycloneDX SBOM Generation ==='
+                    sh 'mkdir -p security-reports/sbom'
+                    def scanDir = env.SOURCE_DIR ?: WORKSPACE
+                    // Trivy CycloneDX SBOM
+                    sh "trivy fs --format cyclonedx --output security-reports/sbom/trivy-cyclonedx-sbom.json '${scanDir}' || true"
+                    // Trivy SPDX SBOM (compliance cross-check)
+                    sh "trivy fs --format spdx-json --output security-reports/sbom/trivy-spdx-sbom.json '${scanDir}' || true"
+                    // Summary
+                    sh """
+                        if [ -f security-reports/sbom/trivy-cyclonedx-sbom.json ]; then
+                            COMP_COUNT=\$(python3 -c "import json; d=json.load(open('security-reports/sbom/trivy-cyclonedx-sbom.json')); print(len(d.get('components',[])))" 2>/dev/null || echo '0')
+                            echo "SBOM Components found: \${COMP_COUNT}"
+                            echo "CycloneDX SBOM: security-reports/sbom/trivy-cyclonedx-sbom.json"
+                            echo "SPDX SBOM:      security-reports/sbom/trivy-spdx-sbom.json"
+                        else
+                            echo 'WARNING: CycloneDX SBOM generation produced no output'
+                        fi
                     """
                 }
             }
