@@ -15,7 +15,7 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timestamps()
         timeout(time: params.TIMEOUT_MINUTES?.toInteger() ?: 60, unit: 'MINUTES')
-        disableConcurrentBuilds()
+        // Concurrent builds supported — each scan gets its own dynamic agent
         ansiColor('xterm')
     }
 
@@ -287,11 +287,73 @@ pipeline {
             when { expression { params.RUN_UNIT_TESTS } }
             steps {
                 script {
+                    // ── Helper: Check if test folders/files exist for the detected language ──
+                    def testsDetected = false
+                    def testFolderMsg = ""
+
                     switch (env.DETECTED_LANG) {
                         case 'python':
-                            sh '''
+                            testsDetected = fileExists('tests') || fileExists('test') ||
+                                sh(script: "find . -maxdepth 3 -name 'test_*.py' -o -name '*_test.py' | head -1", returnStdout: true).trim()
+                            testFolderMsg = "Expected: tests/ or test/ directory, or test_*.py / *_test.py files"
+                            break
+                        case 'java-maven':
+                        case 'java-gradle':
+                            testsDetected = fileExists('src/test') ||
+                                sh(script: "find . -maxdepth 5 -name '*Test.java' -o -name '*Tests.java' | head -1", returnStdout: true).trim()
+                            testFolderMsg = "Expected: src/test/java/ directory, or *Test.java / *Tests.java files"
+                            break
+                        case 'nodejs':
+                        case 'react':
+                        case 'angular':
+                        case 'vue':
+                            testsDetected = fileExists('test') || fileExists('tests') || fileExists('__tests__') || fileExists('spec') ||
+                                sh(script: "find . -maxdepth 4 \\( -name '*.test.js' -o -name '*.test.ts' -o -name '*.test.jsx' -o -name '*.test.tsx' -o -name '*.spec.js' -o -name '*.spec.ts' \\) ! -path '*/node_modules/*' | head -1", returnStdout: true).trim()
+                            testFolderMsg = "Expected: test/, tests/, __tests__/, or *.test.js / *.spec.ts files"
+                            break
+                        case 'go':
+                            testsDetected = sh(script: "find . -maxdepth 5 -name '*_test.go' | head -1", returnStdout: true).trim()
+                            testFolderMsg = "Expected: *_test.go files"
+                            break
+                        case 'dotnet':
+                            testsDetected = fileExists('test') || fileExists('tests') ||
+                                sh(script: "find . -maxdepth 4 -name '*Test*.csproj' -o -name '*Tests*.csproj' | head -1", returnStdout: true).trim()
+                            testFolderMsg = "Expected: test/, tests/ directory, or *Test*.csproj / *Tests*.csproj project"
+                            break
+                        default:
+                            testsDetected = fileExists('test') || fileExists('tests')
+                            testFolderMsg = "Expected: test/ or tests/ directory"
+                    }
+
+                    if (!testsDetected) {
+                        echo """
+==========================================
+  ⚠  NO TESTS FOLDER DETECTED
+==========================================
+  Language: ${env.DETECTED_LANG}
+  ${testFolderMsg}
+
+  No test directory or test files found
+  in the project workspace.
+
+  Please write test cases to enable
+  automated testing in the pipeline.
+==========================================
+                        """
+                        // Write marker to reports for downstream stages
+                        sh "echo 'NO_TESTS_FOUND' > '${REPORTS_DIR}/test-status.txt'"
+                        return
+                    }
+
+                    echo "=== Tests folder detected — running ${env.DETECTED_LANG} unit tests ==="
+
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            // Determine the actual test directory
+                            def pyTestDir = fileExists('tests') ? 'tests/' : (fileExists('test') ? 'test/' : '.')
+                            sh """
                                 echo "=== Pytest — Unit Tests ==="
-                                python3 -m pytest tests/ \
+                                python3 -m pytest ${pyTestDir} \
                                     --junitxml="${REPORTS_DIR}/pytest-unit-results.xml" \
                                     --cov=. \
                                     --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
@@ -305,8 +367,8 @@ pipeline {
                                     --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
                                     --cov-report=term-missing \
                                     -v 2>/dev/null || \
-                                echo "No tests found or pytest not configured"
-                            '''
+                                echo "pytest execution failed — check test configuration"
+                            """
                             break
 
                         case 'java-maven':
@@ -333,7 +395,6 @@ pipeline {
                         case ['nodejs', 'react', 'angular', 'vue']:
                             sh '''
                                 echo "=== Jest/Mocha — Unit Tests ==="
-                                # Try npm test with coverage
                                 if grep -q '"test"' package.json 2>/dev/null; then
                                     npx jest --ci --coverage \
                                         --coverageDirectory="${REPORTS_DIR}/coverage" \
@@ -345,7 +406,6 @@ pipeline {
                                 else
                                     echo "No test script found in package.json"
                                 fi
-                                # Copy coverage
                                 cp coverage/lcov.info "${REPORTS_DIR}/lcov.info" 2>/dev/null || true
                                 cp coverage/coverage-summary.json "${REPORTS_DIR}/coverage-summary.json" 2>/dev/null || true
                             '''
@@ -358,9 +418,7 @@ pipeline {
                                     -coverprofile="${REPORTS_DIR}/go-coverage.out" \
                                     -json > "${REPORTS_DIR}/go-test-results.json" 2>&1 || \
                                 go test ./... -v -coverprofile="${REPORTS_DIR}/go-coverage.out" || echo "Tests failed"
-                                # Generate HTML coverage
                                 go tool cover -html="${REPORTS_DIR}/go-coverage.out" -o "${REPORTS_DIR}/go-coverage.html" 2>/dev/null || true
-                                # Show coverage percentage
                                 go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | tail -1 || true
                             '''
                             break
@@ -402,6 +460,47 @@ pipeline {
             when { expression { params.RUN_INTEGRATION_TESTS } }
             steps {
                 script {
+                    // ── Check if integration test folders exist ──
+                    def integrationTestsDetected = false
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            integrationTestsDetected = fileExists('tests/integration') || fileExists('test/integration') ||
+                                sh(script: "grep -r '@pytest.mark.integration' tests/ test/ 2>/dev/null | head -1", returnStdout: true).trim()
+                            break
+                        case 'java-maven':
+                        case 'java-gradle':
+                            integrationTestsDetected = sh(script: "find . -maxdepth 5 -name '*IT.java' -o -name '*IntegrationTest.java' | head -1", returnStdout: true).trim()
+                            break
+                        case 'nodejs': case 'react': case 'angular': case 'vue':
+                            integrationTestsDetected = fileExists('test/integration') || fileExists('tests/integration') ||
+                                sh(script: "grep -q '\"test:integration\"' package.json 2>/dev/null && echo 'yes'", returnStdout: true).trim()
+                            break
+                        case 'go':
+                            integrationTestsDetected = sh(script: "grep -rl '//go:build integration' . --include='*_test.go' 2>/dev/null | head -1", returnStdout: true).trim()
+                            break
+                        case 'dotnet':
+                            integrationTestsDetected = sh(script: "find . -maxdepth 4 -name '*Integration*.csproj' | head -1", returnStdout: true).trim()
+                            break
+                        default:
+                            integrationTestsDetected = fileExists('tests/integration') || fileExists('test/integration')
+                    }
+
+                    if (!integrationTestsDetected) {
+                        echo """
+==========================================
+  ⚠  NO INTEGRATION TESTS DETECTED
+==========================================
+  Language: ${env.DETECTED_LANG}
+  No integration test directory or files
+  found in the project workspace.
+
+  Please write integration test cases to
+  enable automated integration testing.
+==========================================
+                        """
+                        return
+                    }
+
                     switch (env.DETECTED_LANG) {
                         case 'python':
                             sh '''
