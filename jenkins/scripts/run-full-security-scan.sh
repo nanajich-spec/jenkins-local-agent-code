@@ -443,7 +443,9 @@ scan_shellscripts() {
         if command -v shellcheck &>/dev/null; then
             shellcheck -f tty "${script}" >> "${report}" 2>&1 || true
             local issues
-            issues=$(shellcheck -f json "${script}" 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+            issues=$(shellcheck -f json "${script}" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null | tail -1 || echo "0")
+            issues="${issues//[^0-9]/}"
+            issues="${issues:-0}"
             total_issues=$((total_issues + issues))
         else
             echo "  ShellCheck not installed — manual review:" >> "${report}"
