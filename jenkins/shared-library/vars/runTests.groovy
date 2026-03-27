@@ -18,6 +18,24 @@ def call(Map config = [:]) {
 
     echo "=== Running ${testType} tests [${language}] ==="
 
+    // ── Check if test folder/files exist before running ──
+    if (!detectTestFolder(language, testType)) {
+        echo """
+╔══════════════════════════════════════════════════════════════╗
+║  ⚠  NO TESTS FOLDER DETECTED                                ║
+╠══════════════════════════════════════════════════════════════╣
+║  Language: ${language.padRight(48)}║
+║  Test Type: ${testType.padRight(47)}║
+║                                                              ║
+║  Expected test folder(s) not found.                          ║
+║  Please write test cases in one of these locations:          ║
+${getExpectedTestPaths(language, testType)}║                                                              ║
+║  Skipping ${testType} test execution.                        ║
+╚══════════════════════════════════════════════════════════════╝
+        """
+        return
+    }
+
     switch (language) {
         case 'python':
             runPythonTests(testType, reportsDir, coverage, threshold)
@@ -39,6 +57,78 @@ def call(Map config = [:]) {
             break
         default:
             echo "No test runner for: ${language}"
+    }
+}
+
+// ── Detect if test folders/files exist for the given language ──
+def detectTestFolder(String language, String testType) {
+    switch (language) {
+        case 'python':
+            // Check for tests/, test/, or any test_*.py / *_test.py files
+            return fileExists('tests') || fileExists('test') ||
+                   sh(script: "find . -maxdepth 3 -name 'test_*.py' -o -name '*_test.py' | head -1", returnStdout: true).trim()
+        case 'java-maven':
+        case 'java-gradle':
+            // Check for src/test/ directory or any *Test.java / *Tests.java files
+            return fileExists('src/test') ||
+                   sh(script: "find . -maxdepth 5 -name '*Test.java' -o -name '*Tests.java' -o -name '*IT.java' | head -1", returnStdout: true).trim()
+        case 'nodejs':
+        case 'react':
+        case 'angular':
+        case 'vue':
+            // Check for test/, tests/, __tests__/, spec/, *.test.js/ts, *.spec.js/ts
+            return fileExists('test') || fileExists('tests') || fileExists('__tests__') || fileExists('spec') ||
+                   sh(script: "find . -maxdepth 4 -name '*.test.js' -o -name '*.test.ts' -o -name '*.test.jsx' -o -name '*.test.tsx' -o -name '*.spec.js' -o -name '*.spec.ts' | grep -v node_modules | head -1", returnStdout: true).trim()
+        case 'go':
+            // Check for *_test.go files
+            return sh(script: "find . -maxdepth 5 -name '*_test.go' | head -1", returnStdout: true).trim()
+        case 'dotnet':
+            // Check for *Test*.csproj, *Tests*.csproj, or test folders
+            return fileExists('test') || fileExists('tests') ||
+                   sh(script: "find . -maxdepth 4 -name '*Test*.csproj' -o -name '*Tests*.csproj' -o -name '*.Tests' -type d | head -1", returnStdout: true).trim()
+        default:
+            return fileExists('test') || fileExists('tests')
+    }
+}
+
+// ── Return expected test path hints for the message ──
+def getExpectedTestPaths(String language, String testType) {
+    switch (language) {
+        case 'python':
+            return """║    • tests/           (pytest test directory)                 ║
+║    • test/            (alternative test directory)            ║
+║    • test_*.py        (pytest naming convention)              ║
+║    • *_test.py        (pytest naming convention)              ║
+"""
+        case 'java-maven':
+        case 'java-gradle':
+            return """║    • src/test/java/   (JUnit test directory)                  ║
+║    • *Test.java       (JUnit naming convention)               ║
+║    • *Tests.java      (JUnit naming convention)               ║
+"""
+        case 'nodejs':
+        case 'react':
+        case 'angular':
+        case 'vue':
+            return """║    • test/            (test directory)                         ║
+║    • tests/           (test directory)                        ║
+║    • __tests__/       (Jest test directory)                   ║
+║    • *.test.js/ts     (Jest naming convention)                ║
+║    • *.spec.js/ts     (Mocha/Jasmine naming convention)       ║
+"""
+        case 'go':
+            return """║    • *_test.go        (Go test naming convention)             ║
+"""
+        case 'dotnet':
+            return """║    • test/            (test directory)                         ║
+║    • tests/           (test directory)                        ║
+║    • *Test*.csproj    (.NET test project)                     ║
+║    • *Tests*.csproj   (.NET test project)                     ║
+"""
+        default:
+            return """║    • test/            (test directory)                         ║
+║    • tests/           (test directory)                        ║
+"""
     }
 }
 
