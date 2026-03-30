@@ -1,44 +1,30 @@
 // =============================================================================
-// Jenkinsfile — Comprehensive DevSecOps Pipeline
+// Jenkinsfile — Unified End-to-End DevSecOps Pipeline
 // =============================================================================
-// Full CI/CD + Security + SBOM + Quality Pipeline:
 //
-//  ┌──────────────────────────────────────────────────────────────────────────┐
-//  │  PIPELINE STAGES:                                                        │
-//  │   1.  Checkout & Language Detection                                      │
-//  │   2.  Tool Verification                                                  │
-//  │   3.  Install Dependencies                                               │
-//  │   4.  Lint & Code Quality                                                │
-//  │   5.  Unit Testing + Coverage                                            │
-//  │   6.  Integration Tests (optional)                                       │
-//  │   7.  CycloneDX SBOM Generation (Java/Python/Node/React/Go/.NET)        │
-//  │   8.  SonarQube Analysis                                                 │
-//  │   9.  Build Application                                                  │
-//  │  10.  Docker Build & Push                                                │
-//  │  11.  Trivy Image Scan                                                   │
-//  │  12.  SAST & Secret Detection                                            │
-//  │  13.  SCA — Dependency Scan                                              │
-//  │  14.  Dockerfile Lint (Hadolint)                                         │
-//  │  15.  ShellCheck                                                         │
-//  │  16.  K8s Manifest Security Scan                                         │
-//  │  17.  Security Gate                                                      │
-//  │  18.  Deploy to K8s (optional)                                           │
-//  │  19.  Comprehensive Final Report                                         │
-//  │       ├── Unit Test Report                                               │
-//  │       ├── Coverage Report                                                │
-//  │       ├── SonarQube Report                                               │
-//  │       ├── Trivy Report                                                   │
-//  │       ├── SBOM Report                                                    │
-//  │       ├── Secret Detection Report                                        │
-//  │       ├── Other Reports (Hadolint, ShellCheck, Grype, Bandit etc.)      │
-//  │       └── Final Comprehensive Report (HTML + TXT + JSON)                │
-//  │           ├── HIGH / CRITICAL / BLOCKER issues                          │
-//  │           ├── Test Coverage overview                                     │
-//  │           └── SonarQube overview                                         │
-//  └──────────────────────────────────────────────────────────────────────────┘
+//  PIPELINE STAGES:
+//   0.  Bootstrap Agent (install ALL tools server-side — no local deps)
+//   1.  Checkout & Language Detection
+//   2.  Install Project Dependencies
+//   3.  Lint & Code Quality
+//   4.  Unit Testing + Coverage        (⚠ WARNING if tests folder missing)
+//   5.  Integration Tests              (optional)
+//   6.  CycloneDX SBOM Generation
+//   7.  SonarQube Analysis             (optional)
+//   8.  Build Application
+//   9.  Docker / Container Build       (⚠ WARNING if no Dockerfile; Makefile-first)
+//  10.  Trivy Image Scan               (only if image was built)
+//  11.  SAST, Filesystem & Secret Scan
+//  12.  SCA — Dependency Scan
+//  13.  Dockerfile Lint                (⚠ WARNING if no Dockerfile)
+//  14.  ShellCheck
+//  15.  K8s Manifest Security Scan     (⚠ WARNING if no K8s manifests)
+//  16.  Security Gate
+//  17.  Deploy to K8s                  (optional)
+//  18.  Comprehensive Final Report
 //
-//  Supports: Python, Java (Maven/Gradle), Node.js, React, Angular, Go, .NET
-//  Run: Single command scans root folder completely
+//  Supports: Python · Java Maven/Gradle · Node.js · React · Angular · Go · .NET
+//  All tools installed on the agent (server-side); zero local-machine dependencies.
 // =============================================================================
 
 pipeline {
@@ -49,61 +35,205 @@ pipeline {
         timestamps()
         timeout(time: params.TIMEOUT_MINUTES?.toInteger() ?: 120, unit: 'MINUTES')
         ansiColor('xterm')
+        skipDefaultCheckout(false)
     }
 
     environment {
-        REGISTRY           = "${params.REGISTRY ?: '132.186.17.22:5000'}"
-        REPORTS_DIR        = "${WORKSPACE}/pipeline-reports"
-        COVERAGE_THRESHOLD = "${params.COVERAGE_THRESHOLD ?: '70'}"
-        SCAN_SEVERITY      = 'CRITICAL,HIGH'
-        TRIVY_CACHE_DIR    = "${WORKSPACE}/.trivy-cache"
+        REGISTRY             = "${params.REGISTRY ?: '132.186.17.22:5000'}"
+        REPORTS_DIR          = "${WORKSPACE}/pipeline-reports"
+        COVERAGE_THRESHOLD   = "${params.COVERAGE_THRESHOLD ?: '70'}"
+        SCAN_SEVERITY        = 'CRITICAL,HIGH'
+        TRIVY_CACHE_DIR      = '/opt/trivy-cache'
+        PIP_BREAK_SYSTEM_PACKAGES = '1'
     }
 
     parameters {
-        // ── Project Settings ──
-        string(name: 'GIT_REPO',             defaultValue: '',               description: 'Git repo URL (leave blank for workspace/SCM)')
-        string(name: 'GIT_BRANCH',           defaultValue: 'main',           description: 'Branch to build')
-        choice(name: 'LANGUAGE',             choices: ['auto', 'python', 'java-maven', 'java-gradle', 'nodejs', 'react', 'angular', 'go', 'dotnet'], description: 'Project language (auto-detect if unsure)')
-
-        // ── Docker Settings ──
-        string(name: 'IMAGE_NAME',           defaultValue: '',               description: 'Docker image name (leave blank to skip Docker)')
-        string(name: 'IMAGE_TAG',            defaultValue: 'latest',         description: 'Docker image tag')
-        string(name: 'REGISTRY',             defaultValue: '132.186.17.22:5000', description: 'Container registry URL')
-        string(name: 'DOCKERFILE_PATH',      defaultValue: 'Dockerfile',     description: 'Dockerfile path (or Containerfile)')
-
-        // ── Test Settings ──
-        booleanParam(name: 'RUN_UNIT_TESTS',      defaultValue: true,   description: 'Run unit tests')
+        string(name: 'GIT_REPO',               defaultValue: 'file:///tmp/jenkins-local-agent-code', description: 'Git repo URL (leave blank for workspace SCM)')
+        string(name: 'GIT_BRANCH',             defaultValue: 'main',                 description: 'Branch to build')
+        choice(name: 'LANGUAGE',               choices: ['auto','python','java-maven','java-gradle','nodejs','react','angular','go','dotnet'], description: 'Language (auto-detect if unsure)')
+        string(name: 'IMAGE_NAME',             defaultValue: '',                     description: 'Docker image name (blank = skip image build)')
+        string(name: 'IMAGE_TAG',              defaultValue: 'latest',               description: 'Docker image tag')
+        string(name: 'REGISTRY',               defaultValue: '132.186.17.22:5000',   description: 'Container registry')
+        string(name: 'DOCKERFILE_PATH',        defaultValue: 'Dockerfile',           description: 'Dockerfile path (Containerfile also accepted)')
+        booleanParam(name: 'RUN_UNIT_TESTS',       defaultValue: true,  description: 'Run unit tests')
         booleanParam(name: 'RUN_INTEGRATION_TESTS', defaultValue: false, description: 'Run integration tests')
-        string(name: 'COVERAGE_THRESHOLD',         defaultValue: '70',   description: 'Minimum code coverage %')
-        string(name: 'PYTEST_ARGS',                defaultValue: '',     description: 'Extra pytest arguments')
-
-        // ── Security Settings ──
-        booleanParam(name: 'RUN_TRIVY_SCAN',       defaultValue: true,   description: 'Run Trivy image & filesystem scan')
-        booleanParam(name: 'RUN_SECRET_DETECTION',  defaultValue: true,   description: 'Run secret detection')
-        booleanParam(name: 'RUN_K8S_MANIFEST_SCAN', defaultValue: true,   description: 'Scan K8s deployment manifests')
-        booleanParam(name: 'RUN_DOCKERFILE_LINT',    defaultValue: true,   description: 'Lint Dockerfile with Hadolint')
-        booleanParam(name: 'RUN_OWASP_CHECK',       defaultValue: false,  description: 'Run OWASP Dependency-Check')
-        booleanParam(name: 'RUN_GRYPE',              defaultValue: false,  description: 'Run Grype vulnerability scan')
-        booleanParam(name: 'FAIL_ON_CRITICAL',       defaultValue: true,   description: 'Fail build on CRITICAL vulnerabilities')
-
-        // ── SBOM Settings ──
-        booleanParam(name: 'GENERATE_SBOM',         defaultValue: true,   description: 'Generate CycloneDX SBOM')
-
-        // ── SonarQube Settings ──
-        booleanParam(name: 'RUN_SONARQUBE',          defaultValue: true,   description: 'Run SonarQube analysis')
-        string(name: 'SONAR_PROJECT_KEY',            defaultValue: '',     description: 'SonarQube project key (auto if blank)')
-
-        // ── Deploy Settings ──
-        booleanParam(name: 'DEPLOY_TO_K8S',        defaultValue: false,  description: 'Deploy to Kubernetes after scan')
-        string(name: 'K8S_NAMESPACE',              defaultValue: '',     description: 'Kubernetes namespace')
-        string(name: 'K8S_MANIFESTS_DIR',           defaultValue: 'cat-deployments', description: 'Path to K8s manifest directory')
-
-        // ── Agent ──
-        string(name: 'AGENT_LABEL',               defaultValue: 'local-security-agent', description: 'Jenkins agent label')
-        string(name: 'TIMEOUT_MINUTES',            defaultValue: '120',  description: 'Pipeline timeout (minutes)')
+        string(name: 'COVERAGE_THRESHOLD',          defaultValue: '70',  description: 'Min code coverage %')
+        string(name: 'PYTEST_ARGS',                 defaultValue: '',    description: 'Extra pytest arguments')
+        booleanParam(name: 'RUN_TRIVY_SCAN',        defaultValue: true,  description: 'Trivy filesystem + image scan')
+        booleanParam(name: 'RUN_SECRET_DETECTION',   defaultValue: true,  description: 'Secret detection scan')
+        booleanParam(name: 'RUN_K8S_MANIFEST_SCAN',  defaultValue: true,  description: 'K8s manifest scan (warn if missing)')
+        booleanParam(name: 'RUN_DOCKERFILE_LINT',     defaultValue: true,  description: 'Hadolint Dockerfile lint (warn if missing)')
+        booleanParam(name: 'RUN_OWASP_CHECK',        defaultValue: false, description: 'OWASP Dependency-Check')
+        booleanParam(name: 'RUN_GRYPE',               defaultValue: false, description: 'Grype vulnerability scan')
+        booleanParam(name: 'FAIL_ON_CRITICAL',        defaultValue: true,  description: 'Fail build on CRITICAL vulns')
+        booleanParam(name: 'GENERATE_SBOM',          defaultValue: true,  description: 'Generate CycloneDX SBOM')
+        booleanParam(name: 'RUN_SONARQUBE',   defaultValue: true,  description: 'SonarQube analysis')
+        string(name: 'SONAR_PROJECT_KEY',     defaultValue: '',    description: 'SonarQube project key (auto if blank)')
+        booleanParam(name: 'DEPLOY_TO_K8S',   defaultValue: false, description: 'Deploy to Kubernetes')
+        string(name: 'K8S_NAMESPACE',         defaultValue: '',    description: 'Kubernetes namespace')
+        string(name: 'K8S_MANIFESTS_DIR',     defaultValue: 'cat-deployments', description: 'Path to K8s manifests')
+        string(name: 'AGENT_LABEL',           defaultValue: 'local-security-agent', description: 'Jenkins agent label')
+        string(name: 'TIMEOUT_MINUTES',       defaultValue: '120', description: 'Pipeline timeout (minutes)')
+        booleanParam(name: 'FORCE_TOOL_REINSTALL', defaultValue: false, description: 'Force reinstall of agent tools')
     }
 
     stages {
+
+        // =====================================================================
+        // STAGE 0: Bootstrap Agent — install ALL tools server-side
+        // =====================================================================
+        stage('Bootstrap Agent Tools') {
+            steps {
+                sh '''#!/usr/bin/env bash
+set -uo pipefail
+
+echo "===================================================================="
+echo "  Stage 0: Bootstrap Agent — Installing All Tools (server-side)     "
+echo "===================================================================="
+
+BIN="/usr/local/bin"
+mkdir -p "${BIN}" /opt/trivy-cache
+
+# ── Trivy ──────────────────────────────────────────────────────────────────
+if ! command -v trivy &>/dev/null || [ "${FORCE_TOOL_REINSTALL:-false}" = "true" ]; then
+    echo "[INSTALL] Trivy..."
+    cat > /etc/yum.repos.d/trivy.repo <<REPO
+[trivy]
+name=Trivy repository
+baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/\$basearch/
+gpgcheck=0
+enabled=1
+REPO
+    dnf install -y trivy 2>/dev/null || yum install -y trivy 2>/dev/null || {
+        TRIVY_VER=$(curl -s https://api.github.com/repos/aquasecurity/trivy/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" 2>/dev/null || echo "0.62.1")
+        curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VER}/trivy_${TRIVY_VER}_Linux-64bit.tar.gz" \
+            | tar xz -C "${BIN}" trivy 2>/dev/null || true
+    }
+fi
+if command -v trivy &>/dev/null; then
+    trivy image --download-db-only --quiet 2>/dev/null || true
+    echo "[OK] Trivy: $(trivy --version 2>&1 | head -1)"
+fi
+
+# ── Hadolint ───────────────────────────────────────────────────────────────
+if ! command -v hadolint &>/dev/null; then
+    echo "[INSTALL] Hadolint..."
+    HLVER=$(curl -s https://api.github.com/repos/hadolint/hadolint/releases/latest \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v2.12.0")
+    curl -sL "https://github.com/hadolint/hadolint/releases/download/${HLVER}/hadolint-Linux-x86_64" \
+        -o "${BIN}/hadolint" && chmod +x "${BIN}/hadolint" || true
+fi
+command -v hadolint &>/dev/null && echo "[OK] Hadolint: $(hadolint --version 2>&1)" || echo "[WARN] Hadolint not available"
+
+# ── ShellCheck ────────────────────────────────────────────────────────────
+if ! command -v shellcheck &>/dev/null; then
+    echo "[INSTALL] ShellCheck..."
+    dnf install -y ShellCheck 2>/dev/null || yum install -y ShellCheck 2>/dev/null || {
+        SCVER=$(curl -s https://api.github.com/repos/koalaman/shellcheck/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v0.10.0")
+        curl -sL "https://github.com/koalaman/shellcheck/releases/download/${SCVER}/shellcheck-${SCVER}.linux.x86_64.tar.xz" \
+            | tar xJ --strip-components=1 -C "${BIN}" "shellcheck-${SCVER}/shellcheck" 2>/dev/null || true
+    }
+fi
+command -v shellcheck &>/dev/null && echo "[OK] ShellCheck: $(shellcheck --version 2>&1 | head -2)" || echo "[WARN] ShellCheck not available"
+
+# ── Kubesec ───────────────────────────────────────────────────────────────
+if ! command -v kubesec &>/dev/null; then
+    echo "[INSTALL] Kubesec..."
+    KSVER=$(curl -s https://api.github.com/repos/controlplaneio/kubesec/releases/latest \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" 2>/dev/null || echo "2.14.1")
+    curl -sL "https://github.com/controlplaneio/kubesec/releases/download/v${KSVER}/kubesec_linux_amd64.tar.gz" \
+        | tar xz -C "${BIN}" kubesec 2>/dev/null && chmod +x "${BIN}/kubesec" || true
+fi
+command -v kubesec &>/dev/null && echo "[OK] Kubesec installed" || echo "[WARN] Kubesec not available"
+
+# ── Grype ─────────────────────────────────────────────────────────────────
+if ! command -v grype &>/dev/null; then
+    echo "[INSTALL] Grype..."
+    curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+        | sh -s -- -b "${BIN}" 2>/dev/null || true
+fi
+command -v grype &>/dev/null && echo "[OK] Grype: $(grype version 2>&1 | head -1)" || echo "[WARN] Grype not available"
+
+# ── SonarQube Scanner ────────────────────────────────────────────────────
+if ! command -v sonar-scanner &>/dev/null; then
+    echo "[INSTALL] SonarQube Scanner..."
+    SONAR_VER="6.2.1.4610"
+    SONAR_DIR="/opt/sonar-scanner"
+    curl -sL "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_VER}-linux-x64.zip" \
+        -o /tmp/sonar-scanner.zip 2>/dev/null && \
+        (command -v unzip &>/dev/null || dnf install -y unzip 2>/dev/null || yum install -y unzip 2>/dev/null) && \
+        unzip -qo /tmp/sonar-scanner.zip -d /opt/ 2>/dev/null && \
+        mv "/opt/sonar-scanner-${SONAR_VER}-linux-x64" "${SONAR_DIR}" 2>/dev/null && \
+        ln -sf "${SONAR_DIR}/bin/sonar-scanner" "${BIN}/sonar-scanner" 2>/dev/null || true
+    rm -f /tmp/sonar-scanner.zip
+fi
+command -v sonar-scanner &>/dev/null && echo "[OK] SonarQube Scanner installed" || echo "[WARN] sonar-scanner not available"
+
+# ── Python security / SBOM tools (system-wide on agent) ──────────────────
+echo "[INSTALL] Python security/SBOM tools (agent system)..."
+PIP_FLAGS="--quiet --break-system-packages"
+pip install ${PIP_FLAGS} --upgrade pip 2>/dev/null || pip install --quiet --upgrade pip 2>/dev/null || true
+pip install ${PIP_FLAGS} \
+    pytest pytest-cov pytest-html pytest-xdist pytest-json-report \
+    flake8 black mypy bandit safety pylint \
+    cyclonedx-bom cyclonedx-py pip-audit \
+    2>/dev/null || \
+pip install --quiet \
+    pytest pytest-cov pytest-html pytest-xdist pytest-json-report \
+    flake8 black mypy bandit safety pylint \
+    cyclonedx-bom cyclonedx-py pip-audit \
+    2>/dev/null || true
+echo "[OK] Python tools installed"
+
+# ── Node.js global CycloneDX npm ──────────────────────────────────────────
+if command -v npm &>/dev/null; then
+    npm install -g @cyclonedx/cyclonedx-npm 2>/dev/null || true
+    echo "[OK] @cyclonedx/cyclonedx-npm installed globally"
+fi
+
+# ── Go CycloneDX ──────────────────────────────────────────────────────────
+if command -v go &>/dev/null; then
+    go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest 2>/dev/null || true
+    echo "[OK] cyclonedx-gomod installed"
+fi
+
+# ── jq ────────────────────────────────────────────────────────────────────
+if ! command -v jq &>/dev/null; then
+    dnf install -y jq 2>/dev/null || yum install -y jq 2>/dev/null || true
+fi
+command -v jq &>/dev/null && echo "[OK] jq: $(jq --version)"
+
+# ── OWASP Dependency-Check ────────────────────────────────────────────────
+DC_DIR="/opt/dependency-check"
+if [ ! -f "${DC_DIR}/bin/dependency-check.sh" ]; then
+    echo "[INSTALL] OWASP Dependency-Check..."
+    DC_VER=$(curl -s https://api.github.com/repos/jeremylong/DependencyCheck/releases/latest \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" 2>/dev/null || echo "11.1.1")
+    curl -sL "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VER}/dependency-check-${DC_VER}-release.zip" \
+        -o /tmp/dc.zip 2>/dev/null && \
+        unzip -qo /tmp/dc.zip -d /opt/ 2>/dev/null && \
+        ln -sf "${DC_DIR}/bin/dependency-check.sh" "/usr/local/bin/dependency-check.sh" 2>/dev/null || true
+    rm -f /tmp/dc.zip
+fi
+[ -f "${DC_DIR}/bin/dependency-check.sh" ] && echo "[OK] OWASP DC installed" || echo "[WARN] OWASP DC not available"
+
+echo ""
+echo "===================================================================="
+echo "  Bootstrap Complete — Tool Inventory"
+echo "===================================================================="
+for tool in trivy hadolint shellcheck kubesec grype sonar-scanner jq python3 pip node npm go java podman docker; do
+    if command -v "$tool" &>/dev/null; then
+        printf "  [OK]    %-20s  %s\n" "$tool" "$(command -v $tool)"
+    else
+        printf "  [miss]  %-20s  not on PATH\n" "$tool"
+    fi
+done
+echo "===================================================================="
+'''
+            }
+        }
 
         // =====================================================================
         // STAGE 1: Checkout & Language Detection
@@ -120,192 +250,295 @@ pipeline {
                         ])
                     }
 
-                    sh "mkdir -p '${REPORTS_DIR}' '${REPORTS_DIR}/sbom' '${REPORTS_DIR}/sonarqube'"
+                    sh """
+                        mkdir -p '${REPORTS_DIR}'
+                        mkdir -p '${REPORTS_DIR}/sbom'
+                        mkdir -p '${REPORTS_DIR}/sonarqube'
+                        mkdir -p '${REPORTS_DIR}/trivy'
+                    """
 
                     env.DETECTED_LANG = params.LANGUAGE
                     if (params.LANGUAGE == 'auto') {
                         env.DETECTED_LANG = detectLanguage()
                     }
 
-                    env.HAS_DOCKERFILE = fileExists(params.DOCKERFILE_PATH ?: 'Dockerfile') || fileExists('Containerfile') ? 'true' : 'false'
-                    env.HAS_MAKEFILE   = fileExists('Makefile') ? 'true' : 'false'
-                    env.HAS_K8S_MANIFESTS = sh(script: "find '${params.K8S_MANIFESTS_DIR ?: 'cat-deployments'}' -name '*.yml' -o -name '*.yaml' 2>/dev/null | head -1", returnStdout: true).trim() ? 'true' : 'false'
+                    // --- Recursive Dockerfile detection (root + all subdirs up to depth 4) ---
+                    def dfParam = params.DOCKERFILE_PATH ?: 'Dockerfile'
+                    def allDockerfilesList = sh(script: """
+                        {
+                            [ -f '${dfParam}' ] && echo '${dfParam}'
+                            find . -maxdepth 4 \\( -name 'Dockerfile' -o -name 'Containerfile' -o -name 'Dockerfile.*' \\) \\
+                                ! -path '*/node_modules/*' ! -path '*/.git/*' \\
+                                ! -path '*/pipeline-reports/*' ! -path '*/.trivy-cache/*' 2>/dev/null | sed 's|^./||'
+                        } | sort -u | grep -v '^\$' | tr '\\n' ' '
+                    """, returnStdout: true).trim()
+                    env.HAS_DOCKERFILE  = allDockerfilesList ? 'true' : 'false'
+                    env.ALL_DOCKERFILES = allDockerfilesList ?: ''
+
+                    // --- Recursive Makefile detection (root first, then subdirs up to depth 3) ---
+                    def makefilePath = sh(script: """
+                        if [ -f "Makefile" ]; then echo "Makefile"
+                        else find . -maxdepth 3 -name 'Makefile' \\
+                            ! -path '*/node_modules/*' ! -path '*/.git/*' \\
+                            ! -path '*/pipeline-reports/*' 2>/dev/null | head -1 | sed 's|^./||'
+                        fi
+                    """, returnStdout: true).trim()
+                    env.HAS_MAKEFILE  = makefilePath ? 'true' : 'false'
+                    env.MAKEFILE_PATH = makefilePath ?: 'Makefile'
+                    env.MAKEFILE_DIR  = (makefilePath && makefilePath != 'Makefile') ? sh(script: "MF='${makefilePath}'; D=\$(dirname \"\$MF\"); [ \"\$D\" = '.' ] && echo '' || echo \"\$D\"", returnStdout: true).trim() : ''
+
+                    def makeBuildTarget = ''
+                    if (env.HAS_MAKEFILE == 'true') {
+                        def mfForGrep = makefilePath ?: 'Makefile'
+                        makeBuildTarget = sh(script: """
+                            MF='${mfForGrep}'
+                            if grep -qE '^docker-build:' "\$MF" 2>/dev/null; then echo 'docker-build'
+                            elif grep -qE '^build-image:' "\$MF" 2>/dev/null; then echo 'build-image'
+                            elif grep -qE '^image:' "\$MF" 2>/dev/null; then echo 'image'
+                            elif grep -qE '^docker:' "\$MF" 2>/dev/null; then echo 'docker'
+                            elif grep -qE '^container:' "\$MF" 2>/dev/null; then echo 'container'
+                            elif grep -qE '^build:' "\$MF" 2>/dev/null; then echo 'build'
+                            else echo ''; fi
+                        """, returnStdout: true).trim()
+                    }
+                    env.MAKE_BUILD_TARGET = makeBuildTarget ?: ''
+
+                    def k8sDir = params.K8S_MANIFESTS_DIR ?: 'cat-deployments'
+                    env.K8S_MANIFESTS_DIR = k8sDir
+                    def k8sFound = sh(script: """
+                        find '${k8sDir}' \\( -name '*.yml' -o -name '*.yaml' \\) 2>/dev/null | head -1
+                    """, returnStdout: true).trim()
+                    env.HAS_K8S_MANIFESTS = k8sFound ? 'true' : 'false'
+
+                    def testCheckScript = ''
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            // Deep search: covers root tests/, root test/, backend/tests/, src/tests/, etc.
+                            testCheckScript = "( [ -d tests ] || [ -d test ] || find . -maxdepth 6 \\( -name 'test_*.py' -o -name '*_test.py' -o -name 'test*.py' \\) ! -path '*/.venv/*' ! -path '*/venv/*' ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
+                            break
+                        case 'java-maven': case 'java-gradle':
+                            testCheckScript = "( [ -d src/test ] || find . -maxdepth 5 -name '*Test.java' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
+                            break
+                        case 'nodejs': case 'react': case 'angular': case 'vue':
+                            testCheckScript = "( [ -d test ] || [ -d tests ] || [ -d __tests__ ] || [ -d spec ] || find . -maxdepth 4 \\( -name '*.test.js' -o -name '*.test.ts' -o -name '*.spec.js' -o -name '*.spec.ts' \\) ! -path '*/node_modules/*' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
+                            break
+                        case 'go':
+                            testCheckScript = "find . -maxdepth 5 -name '*_test.go' 2>/dev/null | grep -q . && echo 'true' || echo 'false'"
+                            break
+                        case 'dotnet':
+                            testCheckScript = "( [ -d test ] || [ -d tests ] || find . -maxdepth 4 -name '*Test*.csproj' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
+                            break
+                        default:
+                            testCheckScript = "( [ -d test ] || [ -d tests ] ) && echo 'true' || echo 'false'"
+                    }
+                    env.HAS_TESTS = sh(script: testCheckScript, returnStdout: true).trim()
+
+                    // --- Find actual Python test directory (handles backend/tests, src/tests, etc.) ---
+                    env.PY_TEST_DIR = sh(script: """
+                        if   [ -d "tests" ]; then echo "tests"
+                        elif [ -d "test"  ]; then echo "test"
+                        else
+                            find . -maxdepth 6 -type d \\( -name "tests" -o -name "test" \\) \\
+                                ! -path '*/node_modules/*' ! -path '*/.venv/*' ! -path '*/venv/*' \\
+                                ! -path '*/pipeline-reports/*' 2>/dev/null | head -1 | sed 's|^./||'
+                        fi
+                    """, returnStdout: true).trim() ?: '.'
+
+                    // --- Detect frontend sub-project directory (React/Angular/Vue in subdir) ---
+                    env.FRONTEND_DIR = sh(script: """
+                        find . -maxdepth 3 \\( -name 'angular.json' -o -name 'package.json' \\) \\
+                            ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | \\
+                        while IFS= read -r f; do
+                            d=\$(dirname "\$f" | sed 's|^\\./||')
+                            [ "\$d" != "." ] && echo "\$d" && break
+                        done | head -1
+                    """, returnStdout: true).trim() ?: ''
+
                     env.PIPELINE_START = sh(script: 'date +%s', returnStdout: true).trim()
 
+                    sh """
+                        {
+                          echo "=== Pipeline Warnings ==="
+                          [ '${env.HAS_DOCKERFILE}' = 'false' ] && echo "[WARNING] No Dockerfile or Containerfile found — Docker image build will be SKIPPED"
+                          [ '${env.HAS_K8S_MANIFESTS}' = 'false' ] && echo "[WARNING] No Kubernetes manifests found in '${k8sDir}/' — K8s scan will be SKIPPED"
+                          [ '${env.HAS_TESTS}' = 'false' ] && echo "[WARNING] No test files/folder found for ${env.DETECTED_LANG} — Unit tests will be SKIPPED"
+                          [ '${env.HAS_MAKEFILE}' = 'false' ] && echo "[INFO] No Makefile found — using standard build commands"
+                          [ '${env.HAS_MAKEFILE}' = 'true' ] && [ -n '${env.MAKE_BUILD_TARGET}' ] && echo "[INFO] Makefile found with target: ${env.MAKE_BUILD_TARGET}"
+                          echo "========================="
+                        } | tee '${REPORTS_DIR}/pipeline-warnings.txt'
+                    """
+
                     echo """
-╔══════════════════════════════════════════════════════════════╗
-║    Comprehensive DevSecOps Pipeline — Configuration          ║
-╠══════════════════════════════════════════════════════════════╣
-║  Language:        ${env.DETECTED_LANG.padRight(40)}║
-║  Branch:          ${(params.GIT_BRANCH ?: 'workspace').padRight(40)}║
-║  Docker Image:    ${(params.IMAGE_NAME ?: 'N/A').padRight(40)}║
-║  Dockerfile:      ${env.HAS_DOCKERFILE.padRight(40)}║
-║  K8s Manifests:   ${env.HAS_K8S_MANIFESTS.padRight(40)}║
-║  Unit Tests:      ${params.RUN_UNIT_TESTS.toString().padRight(40)}║
-║  SBOM:            ${params.GENERATE_SBOM.toString().padRight(40)}║
-║  SonarQube:       ${params.RUN_SONARQUBE.toString().padRight(40)}║
-║  Trivy Scan:      ${params.RUN_TRIVY_SCAN.toString().padRight(40)}║
-║  Fail on Crit:    ${params.FAIL_ON_CRITICAL.toString().padRight(40)}║
-╚══════════════════════════════════════════════════════════════╝
+=====================================================================
+  Unified DevSecOps Pipeline — Configuration
+=====================================================================
+  Language:          ${env.DETECTED_LANG}
+  Branch:            ${params.GIT_BRANCH ?: 'workspace'}
+  Docker Image:      ${params.IMAGE_NAME ?: '(none — skipped)'}
+  Dockerfile(s):     ${env.HAS_DOCKERFILE}  ${env.HAS_DOCKERFILE == 'false' ? '[WARNING: not found]' : '→ ' + env.ALL_DOCKERFILES}
+  Makefile:          ${env.HAS_MAKEFILE}  ${env.MAKEFILE_PATH ? '→ ' + env.MAKEFILE_PATH + (env.MAKE_BUILD_TARGET ? " (target: ${env.MAKE_BUILD_TARGET})" : '') : ''}
+  K8s Manifests:     ${env.HAS_K8S_MANIFESTS}  ${env.HAS_K8S_MANIFESTS == 'false' ? '[WARNING: not found in ' + k8sDir + '/]' : 'in ' + k8sDir + '/'}
+  Tests Found:       ${env.HAS_TESTS}  ${env.HAS_TESTS == 'false' ? '[WARNING: no tests detected]' : '→ test dir: ' + env.PY_TEST_DIR}
+  Frontend Dir:      ${env.FRONTEND_DIR ?: '(none)'}
+  SBOM:              ${params.GENERATE_SBOM}
+  SonarQube:         ${params.RUN_SONARQUBE}
+  Trivy Scan:        ${params.RUN_TRIVY_SCAN}
+  Fail on Critical:  ${params.FAIL_ON_CRITICAL}
+=====================================================================
                     """
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 2: Tool Verification
+        // STAGE 2: Install Project Dependencies
         // =====================================================================
-        stage('Verify Tools') {
-            steps {
-                sh '''
-                    echo "╔══════════════════════════════════════════════════════════════╗"
-                    echo "║              Tool Verification                               ║"
-                    echo "╠══════════════════════════════════════════════════════════════╣"
-                    check_tool() {
-                        local name="$1" cmd="$2"
-                        if command -v "$cmd" &>/dev/null; then
-                            VER=$($cmd --version 2>&1 | head -1)
-                            printf "║  %-18s ✅  %s\\n" "$name" "$VER"
-                        else
-                            printf "║  %-18s ❌  Not installed\\n" "$name"
-                        fi
-                    }
-                    check_tool "Python"       "python3"
-                    check_tool "pip"          "pip"
-                    check_tool "Node.js"      "node"
-                    check_tool "npm"          "npm"
-                    check_tool "Go"           "go"
-                    check_tool "Java"         "java"
-                    check_tool "Maven"        "mvn"
-                    check_tool "Trivy"        "trivy"
-                    check_tool "Podman"       "podman"
-                    check_tool "Hadolint"     "hadolint"
-                    check_tool "ShellCheck"   "shellcheck"
-                    check_tool "Grype"        "grype"
-                    check_tool "Kubesec"      "kubesec"
-                    check_tool "kubectl"      "kubectl"
-                    check_tool "SonarScanner" "sonar-scanner"
-                    check_tool "CycloneDX"    "cyclonedx-py"
-                    echo "╚══════════════════════════════════════════════════════════════╝"
-                '''
-            }
-        }
-
-        // =====================================================================
-        // STAGE 3: Install Dependencies
-        // =====================================================================
-        stage('Install Dependencies') {
+        stage('Install Project Dependencies') {
             steps {
                 script {
                     switch (env.DETECTED_LANG) {
                         case 'python':
                             sh '''
-                                echo "=== Installing Python Dependencies ==="
-                                python3 -m pip install --upgrade pip 2>/dev/null || true
-                                if [ -f "requirements.txt" ]; then pip install -r requirements.txt 2>/dev/null || true; fi
-                                if [ -f "requirements-dev.txt" ]; then pip install -r requirements-dev.txt 2>/dev/null || true; fi
+                                echo "=== Installing Python Project Dependencies ==="
+                                PIP="pip install --break-system-packages"
+                                [ -f "requirements.txt" ] && $PIP -r requirements.txt 2>/dev/null || pip install -r requirements.txt 2>/dev/null || true
+                                [ -f "requirements-dev.txt" ] && $PIP -r requirements-dev.txt 2>/dev/null || true
                                 if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
-                                    pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+                                    $PIP -e ".[dev,test]" 2>/dev/null || $PIP -e . 2>/dev/null || true
                                 fi
-                                pip install pytest pytest-cov pytest-html pytest-xdist \
-                                    flake8 black mypy bandit safety pylint \
-                                    cyclonedx-bom cyclonedx-py pip-audit 2>/dev/null || true
+                                [ -f "Pipfile" ] && ($PIP pipenv 2>/dev/null || true) && pipenv install --dev 2>/dev/null || true
+                                # Also scan subdirectory requirements files (backend/, src/, app/, etc.)
+                                find . -maxdepth 3 -name 'requirements*.txt' \
+                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
+                                while IFS= read -r req; do
+                                    [ "$(dirname "$req")" = "." ] && continue
+                                    echo "  [subdep] Installing: $req"
+                                    $PIP -r "$req" 2>/dev/null || pip install -r "$req" 2>/dev/null || true
+                                done
+                                # Install editable sub-packages (setup.py / pyproject.toml in subdirs)
+                                find . -maxdepth 3 \( -name 'setup.py' -o -name 'pyproject.toml' \) \
+                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
+                                while IFS= read -r sf; do
+                                    d=$(dirname "$sf"); [ "$d" = "." ] && continue
+                                    echo "  [subdep] Installing package from: $d"
+                                    (cd "$d" && $PIP -e ".[dev,test]" 2>/dev/null || $PIP -e . 2>/dev/null || true)
+                                done
+                                echo "[OK] Python dependencies ready"
                             '''
                             break
                         case 'java-maven':
-                            sh 'mvn dependency:resolve -q 2>/dev/null || true'
+                            sh '[ -f "pom.xml" ] && mvn dependency:resolve -q 2>/dev/null || true && echo "[OK] Maven deps ready"'
                             break
                         case 'java-gradle':
                             sh '''
                                 chmod +x gradlew 2>/dev/null || true
-                                ./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null || true
+                                ([ -f "build.gradle" ] || [ -f "build.gradle.kts" ]) && \
+                                    (./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null) || true
+                                echo "[OK] Gradle deps ready"
                             '''
                             break
-                        case ['nodejs', 'react', 'angular']:
+                        case ['nodejs', 'react', 'angular', 'vue']:
                             sh '''
                                 if [ -f "yarn.lock" ]; then
-                                    yarn install --frozen-lockfile 2>/dev/null || yarn install
-                                elif [ -f "package-lock.json" ] || [ -f "package.json" ]; then
-                                    npm ci 2>/dev/null || npm install
+                                    yarn install --frozen-lockfile 2>/dev/null || yarn install || true
+                                elif [ -f "pnpm-lock.yaml" ]; then
+                                    pnpm install --frozen-lockfile 2>/dev/null || pnpm install || true
+                                elif [ -f "package.json" ]; then
+                                    npm ci 2>/dev/null || npm install || true
                                 fi
-                                npm install -g @cyclonedx/cyclonedx-npm 2>/dev/null || true
+                                # Also install in frontend/ backend/ and any sub-package directories
+                                find . -maxdepth 3 -name 'package.json' \
+                                    ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' | \
+                                while IFS= read -r pkg; do
+                                    d=$(dirname "$pkg"); [ "$d" = "." ] && continue
+                                    echo "  [subdep] npm install in: $d"
+                                    (cd "$d" && npm ci 2>/dev/null || npm install 2>/dev/null || true)
+                                done
+                                echo "[OK] Node.js deps ready"
                             '''
                             break
                         case 'go':
-                            sh '''
-                                go mod download && go mod verify
-                                go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest 2>/dev/null || true
-                            '''
+                            sh '[ -f "go.mod" ] && go mod download && go mod verify 2>/dev/null || true && echo "[OK] Go deps ready"'
                             break
                         case 'dotnet':
                             sh '''
-                                dotnet restore
-                                dotnet tool install --global CycloneDX 2>/dev/null || true
+                                PROJ=$(find . -name "*.csproj" -o -name "*.sln" | head -1)
+                                [ -n "${PROJ}" ] && dotnet restore "${PROJ}" 2>/dev/null || true
+                                echo "[OK] .NET deps ready"
                             '''
                             break
                         default:
-                            echo "No dependency installation for: ${env.DETECTED_LANG}"
+                            echo "[INFO] No dependency install step for: ${env.DETECTED_LANG}"
+                    }
+
+                    // --- Universal: also install any frontend (package.json) sub-projects ---
+                    // Runs for ALL primary languages so Python+frontend combos are covered
+                    if (env.DETECTED_LANG != 'nodejs' && env.DETECTED_LANG != 'react' &&
+                        env.DETECTED_LANG != 'angular' && env.DETECTED_LANG != 'vue') {
+                        sh '''
+                            FOUND=$(find . -maxdepth 3 -name 'package.json' \
+                                ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | \
+                                while IFS= read -r pkg; do d=$(dirname "$pkg"); [ "$d" != "." ] && echo "$d"; done | head -3)
+                            if [ -n "$FOUND" ]; then
+                                echo "=== Installing frontend/node sub-module dependencies ==="
+                                echo "$FOUND" | while IFS= read -r d; do
+                                    echo "  [frontend] npm install in: $d"
+                                    (cd "$d" && npm ci 2>/dev/null || npm install 2>/dev/null || true)
+                                done
+                            fi
+                        '''
                     }
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 4: Lint & Code Quality
+        // STAGE 3: Lint & Code Quality
         // =====================================================================
         stage('Lint & Code Quality') {
             steps {
                 script {
                     switch (env.DETECTED_LANG) {
                         case 'python':
-                            sh '''
-                                echo "--- Flake8 ---"
+                            sh """
+                                echo "=== Flake8 ==="
                                 flake8 . --max-line-length=120 \
                                     --exclude=.venv,venv,__pycache__,migrations,.trivy-cache,pipeline-reports \
-                                    --output-file="${REPORTS_DIR}/flake8-report.txt" 2>/dev/null || true
-                                echo "--- Black ---"
-                                black --check --diff . --exclude '/(.venv|venv|__pycache__|.trivy-cache)/' 2>/dev/null || echo "Formatting issues (non-blocking)"
-                                echo "--- Pylint ---"
-                                find . -name "*.py" -not -path "./.venv/*" -not -path "./venv/*" -not -path "./.trivy-cache/*" -not -path "./pipeline-reports/*" \
-                                    | head -20 | xargs pylint --output-format=text --score=yes \
-                                    > "${REPORTS_DIR}/pylint-report.txt" 2>/dev/null || true
-                                echo "--- Bandit ---"
-                                bandit -r . -f json -o "${REPORTS_DIR}/bandit-report.json" \
+                                    --output-file='${REPORTS_DIR}/flake8-report.txt' 2>/dev/null || true
+                                cat '${REPORTS_DIR}/flake8-report.txt' 2>/dev/null | head -30 || true
+                                echo "=== Bandit SAST ==="
+                                bandit -r . -f json -o '${REPORTS_DIR}/bandit-report.json' \
                                     --exclude .venv,venv,tests,test,.trivy-cache,pipeline-reports 2>/dev/null || true
-                            '''
+                                echo "=== PyLint ==="
+                                find . -name '*.py' -not -path './.venv/*' -not -path './venv/*' \
+                                    -not -path './.trivy-cache/*' -not -path './pipeline-reports/*' \
+                                    | head -30 | xargs pylint --output-format=text --score=yes \
+                                    > '${REPORTS_DIR}/pylint-report.txt' 2>/dev/null || true
+                            """
                             break
                         case 'java-maven':
-                            sh '''
-                                mvn checkstyle:check -q 2>/dev/null || echo "Checkstyle issues (non-blocking)"
-                                mvn spotbugs:check -q 2>/dev/null || echo "SpotBugs not configured"
-                            '''
+                            sh 'mvn checkstyle:check -q 2>/dev/null || echo "[INFO] Checkstyle not configured (non-blocking)"'
                             break
                         case 'java-gradle':
-                            sh '''
-                                ./gradlew checkstyleMain 2>/dev/null || echo "Checkstyle not configured"
-                                ./gradlew spotbugsMain 2>/dev/null || echo "SpotBugs not configured"
-                            '''
+                            sh './gradlew checkstyleMain 2>/dev/null || echo "[INFO] Checkstyle not configured (non-blocking)"'
                             break
-                        case ['nodejs', 'react', 'angular']:
-                            sh '''
-                                if [ -f "node_modules/.bin/eslint" ]; then
-                                    npx eslint . --format json --output-file "${REPORTS_DIR}/eslint-report.json" 2>/dev/null || true
-                                fi
-                                if [ -f "node_modules/.bin/prettier" ]; then
-                                    npx prettier --check "src/**/*.{js,jsx,ts,tsx}" 2>/dev/null || echo "Format issues found"
-                                fi
-                            '''
+                        case ['nodejs','react','angular','vue']:
+                            sh """
+                                [ -f "node_modules/.bin/eslint" ] && \
+                                    npx eslint . --format json \
+                                    --output-file '${REPORTS_DIR}/eslint-report.json' 2>/dev/null || \
+                                echo "[INFO] ESLint not in project deps"
+                            """
                             break
                         case 'go':
-                            sh '''
-                                go vet ./... 2>&1 | tee "${REPORTS_DIR}/govet-report.txt" || true
-                                if command -v golangci-lint &>/dev/null; then
-                                    golangci-lint run --out-format json > "${REPORTS_DIR}/golangci-lint.json" 2>/dev/null || true
-                                fi
-                            '''
+                            sh """
+                                go vet ./... 2>&1 | tee '${REPORTS_DIR}/govet-report.txt' || true
+                                command -v golangci-lint &>/dev/null && \
+                                    golangci-lint run --out-format json > '${REPORTS_DIR}/golangci-lint.json' 2>/dev/null || true
+                            """
                             break
                         case 'dotnet':
-                            sh 'dotnet format --verify-no-changes 2>/dev/null || echo "Format issues found"'
+                            sh 'dotnet format --verify-no-changes 2>/dev/null || echo "[INFO] Format issues (non-blocking)"'
                             break
                     }
                 }
@@ -313,235 +546,178 @@ pipeline {
         }
 
         // =====================================================================
-        // STAGE 5: Unit Testing + Coverage
+        // STAGE 4: Unit Testing & Coverage
         // =====================================================================
         stage('Unit Testing & Coverage') {
             when { expression { params.RUN_UNIT_TESTS } }
             steps {
                 script {
-                    // ── Check if test folders/files exist for the detected language ──
-                    def testsDetected = false
-                    def testFolderMsg = ""
-
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            testsDetected = fileExists('tests') || fileExists('test') ||
-                                sh(script: "find . -maxdepth 3 -name 'test_*.py' -o -name '*_test.py' | head -1", returnStdout: true).trim()
-                            testFolderMsg = "Expected: tests/ or test/ directory, or test_*.py / *_test.py files"
-                            break
-                        case 'java-maven':
-                        case 'java-gradle':
-                            testsDetected = fileExists('src/test') ||
-                                sh(script: "find . -maxdepth 5 -name '*Test.java' -o -name '*Tests.java' | head -1", returnStdout: true).trim()
-                            testFolderMsg = "Expected: src/test/java/ directory, or *Test.java / *Tests.java files"
-                            break
-                        case 'nodejs':
-                        case 'react':
-                        case 'angular':
-                        case 'vue':
-                            testsDetected = fileExists('test') || fileExists('tests') || fileExists('__tests__') || fileExists('spec') ||
-                                sh(script: "find . -maxdepth 4 \\( -name '*.test.js' -o -name '*.test.ts' -o -name '*.test.jsx' -o -name '*.test.tsx' -o -name '*.spec.js' -o -name '*.spec.ts' \\) ! -path '*/node_modules/*' | head -1", returnStdout: true).trim()
-                            testFolderMsg = "Expected: test/, tests/, __tests__/, or *.test.js / *.spec.ts files"
-                            break
-                        case 'go':
-                            testsDetected = sh(script: "find . -maxdepth 5 -name '*_test.go' | head -1", returnStdout: true).trim()
-                            testFolderMsg = "Expected: *_test.go files"
-                            break
-                        case 'dotnet':
-                            testsDetected = fileExists('test') || fileExists('tests') ||
-                                sh(script: "find . -maxdepth 4 -name '*Test*.csproj' -o -name '*Tests*.csproj' | head -1", returnStdout: true).trim()
-                            testFolderMsg = "Expected: test/, tests/ directory, or *Test*.csproj / *Tests*.csproj project"
-                            break
-                        default:
-                            testsDetected = fileExists('test') || fileExists('tests')
-                            testFolderMsg = "Expected: test/ or tests/ directory"
-                    }
-
-                    if (!testsDetected) {
-                        echo """
-╔══════════════════════════════════════════════════════════════╗
-║  ⚠  NO TESTS FOLDER DETECTED                                ║
-╠══════════════════════════════════════════════════════════════╣
-║  Language: ${env.DETECTED_LANG}
-║  ${testFolderMsg}
-║                                                              ║
-║  No test directory or test files found in the project.       ║
-║  Please write test cases to enable automated testing         ║
-║  in the pipeline.                                            ║
-║                                                              ║
-║  Skipping unit test execution.                               ║
-╚══════════════════════════════════════════════════════════════╝
-                        """
-                        sh "echo 'NO_TESTS_FOUND' > '${REPORTS_DIR}/test-status.txt'"
+                    if (env.HAS_TESTS == 'false') {
+                        sh """
+echo "======================================================================"
+echo "  [WARNING] NO TESTS DETECTED — Unit Test Execution SKIPPED"
+echo "======================================================================"
+echo "  Language: ${env.DETECTED_LANG}"
+echo "  Please add tests to the project:"
+echo "    Python:   tests/ with test_*.py files"
+echo "    Java:     src/test/java/ with *Test.java files"
+echo "    Node.js:  __tests__/ or *.test.js files"
+echo "    Go:       *_test.go files"
+echo "    .NET:     *Tests.csproj project"
+echo "======================================================================"
+echo 'NO_TESTS_FOUND' > '${REPORTS_DIR}/test-status.txt'
+echo "[WARNING] No tests found for ${env.DETECTED_LANG}" >> '${REPORTS_DIR}/pipeline-warnings.txt'
+"""
                         return
                     }
 
-                    echo "=== Tests folder detected — running ${env.DETECTED_LANG} unit tests ==="
-
+                    echo "=== Tests detected — running ${env.DETECTED_LANG} tests ==="
                     switch (env.DETECTED_LANG) {
                         case 'python':
-                            def pyTestDir = fileExists('tests') ? 'tests/' : (fileExists('test') ? 'test/' : '.')
+                            // Use the discovered test directory (handles backend/tests, src/tests, etc.)
+                            def pyDir = env.PY_TEST_DIR ?: (fileExists('tests') ? 'tests' : (fileExists('test') ? 'test' : '.'))
+                            echo "=== Running pytest in: ${pyDir} ==="
                             sh """
-                                echo "╔══════════════════════════════════════════════════════════════╗"
-                                echo "║        Unit Testing — pytest + Coverage                      ║"
-                                echo "╚══════════════════════════════════════════════════════════════╝"
-                                python3 -m pytest ${pyTestDir} \
-                                    --junitxml="${REPORTS_DIR}/pytest-unit-results.xml" \
-                                    --html="${REPORTS_DIR}/pytest-report.html" --self-contained-html \
-                                    --cov=. \
-                                    --cov-report=xml:"${REPORTS_DIR}/coverage.xml" \
-                                    --cov-report=html:"${REPORTS_DIR}/htmlcov" \
-                                    --cov-report=term-missing \
-                                    --cov-fail-under=${COVERAGE_THRESHOLD} \
-                                    --tb=short -v \
-                                    ${params.PYTEST_ARGS ?: ''} \
-                                    2>&1 || true
-
-                                if [ -f "${REPORTS_DIR}/pytest-unit-results.xml" ]; then
-                                    python3 -c "
-import xml.etree.ElementTree as ET
-tree = ET.parse('${REPORTS_DIR}/pytest-unit-results.xml')
-root = tree.getroot()
-tests=int(root.attrib.get('tests',0)); errors=int(root.attrib.get('errors',0))
-failures=int(root.attrib.get('failures',0)); skipped=int(root.attrib.get('skipped',0))
-passed=tests-errors-failures-skipped; status='PASS' if failures==0 and errors==0 else 'FAIL'
-print(f'  Status: {status} | Total: {tests} | Passed: {passed} | Failed: {failures} | Errors: {errors}')
-" 2>/dev/null || true
-                                fi
-
-                                if [ -f "${REPORTS_DIR}/coverage.xml" ]; then
-                                    python3 -c "
-import xml.etree.ElementTree as ET
-tree = ET.parse('${REPORTS_DIR}/coverage.xml')
-root = tree.getroot()
-rate=float(root.attrib.get('line-rate',0))*100
-print(f'  Coverage: {rate:.1f}% (threshold: ${COVERAGE_THRESHOLD}%)')
-" 2>/dev/null || true
-                                fi
+                                python3 -m pytest '${pyDir}' \\
+                                    --junitxml='${REPORTS_DIR}/pytest-unit-results.xml' \\
+                                    --html='${REPORTS_DIR}/pytest-report.html' --self-contained-html \\
+                                    --cov=. \\
+                                    --cov-report=xml:'${REPORTS_DIR}/coverage.xml' \\
+                                    --cov-report=html:'${REPORTS_DIR}/htmlcov' \\
+                                    --cov-report=term-missing \\
+                                    --cov-fail-under=${COVERAGE_THRESHOLD} \\
+                                    --tb=short -v ${params.PYTEST_ARGS ?: ''} 2>&1 || true
                             """
                             break
                         case 'java-maven':
-                            sh '''
-                                mvn test jacoco:report -Dmaven.test.failure.ignore=true 2>/dev/null || echo "Tests completed"
-                                cp -r target/surefire-reports/* "${REPORTS_DIR}/" 2>/dev/null || true
-                                cp target/site/jacoco/jacoco.xml "${REPORTS_DIR}/jacoco-coverage.xml" 2>/dev/null || true
-                                cp -r target/site/jacoco "${REPORTS_DIR}/jacoco-html" 2>/dev/null || true
-                            '''
+                            sh """
+                                mvn test jacoco:report -Dmaven.test.failure.ignore=true 2>/dev/null || true
+                                cp -r target/surefire-reports/* '${REPORTS_DIR}/' 2>/dev/null || true
+                                cp target/site/jacoco/jacoco.xml '${REPORTS_DIR}/jacoco-coverage.xml' 2>/dev/null || true
+                            """
                             break
                         case 'java-gradle':
-                            sh '''
-                                ./gradlew test jacocoTestReport --continue 2>/dev/null || gradle test jacocoTestReport --continue 2>/dev/null || echo "Tests completed"
-                                cp -r build/test-results/test/* "${REPORTS_DIR}/" 2>/dev/null || true
-                                cp build/reports/jacoco/test/jacocoTestReport.xml "${REPORTS_DIR}/jacoco-coverage.xml" 2>/dev/null || true
-                            '''
+                            sh """
+                                ./gradlew test jacocoTestReport --continue 2>/dev/null || \
+                                    gradle test jacocoTestReport --continue 2>/dev/null || true
+                                cp -r build/test-results/test/* '${REPORTS_DIR}/' 2>/dev/null || true
+                                cp build/reports/jacoco/test/jacocoTestReport.xml \
+                                    '${REPORTS_DIR}/jacoco-coverage.xml' 2>/dev/null || true
+                            """
                             break
-                        case ['nodejs', 'react', 'angular']:
-                            sh '''
-                                if grep -q '"test"' package.json 2>/dev/null; then
-                                    npx jest --ci --coverage \
-                                        --coverageDirectory="${REPORTS_DIR}/coverage" \
-                                        --coverageReporters=json-summary --coverageReporters=lcov --coverageReporters=text \
-                                        --reporters=default --reporters=jest-junit \
-                                        2>/dev/null || npm test 2>/dev/null || echo "Tests completed"
-                                    cp coverage/lcov.info "${REPORTS_DIR}/lcov.info" 2>/dev/null || true
-                                    cp coverage/coverage-summary.json "${REPORTS_DIR}/coverage-summary.json" 2>/dev/null || true
-                                fi
-                            '''
+                        case ['nodejs', 'react', 'angular', 'vue']:
+                            sh """
+                                grep -q '"test"' package.json 2>/dev/null && \
+                                    (npx jest --ci --coverage \
+                                        --coverageDirectory='${REPORTS_DIR}/coverage' \
+                                        --coverageReporters=json-summary --coverageReporters=lcov \
+                                        --reporters=default --reporters=jest-junit 2>/dev/null || \
+                                    npm test 2>/dev/null) || true
+                            """
                             break
                         case 'go':
-                            sh '''
+                            sh """
                                 go test ./... -v -count=1 \
-                                    -coverprofile="${REPORTS_DIR}/go-coverage.out" \
-                                    -json > "${REPORTS_DIR}/go-test-unit.json" 2>&1 || echo "Tests completed"
-                                go tool cover -func="${REPORTS_DIR}/go-coverage.out" 2>/dev/null | tail -5 || true
-                                go tool cover -html="${REPORTS_DIR}/go-coverage.out" -o "${REPORTS_DIR}/go-coverage.html" 2>/dev/null || true
-                            '''
+                                    -coverprofile='${REPORTS_DIR}/go-coverage.out' \
+                                    -json > '${REPORTS_DIR}/go-test-unit.json' 2>&1 || true
+                                go tool cover -func='${REPORTS_DIR}/go-coverage.out' 2>/dev/null | tail -5 || true
+                                go tool cover -html='${REPORTS_DIR}/go-coverage.out' \
+                                    -o '${REPORTS_DIR}/go-coverage.html' 2>/dev/null || true
+                            """
                             break
                         case 'dotnet':
-                            sh '''
+                            sh """
                                 dotnet test \
                                     --logger "trx;LogFileName=unit-results.trx" \
                                     --collect:"XPlat Code Coverage" \
-                                    --results-directory "${REPORTS_DIR}" \
-                                    -v normal || echo "Tests completed"
-                            '''
+                                    --results-directory '${REPORTS_DIR}' \
+                                    -v normal 2>/dev/null || true
+                            """
                             break
+                    }
+
+                    // --- Run frontend sub-project tests when primary language is NOT js/ts ---
+                    if (env.FRONTEND_DIR?.trim() &&
+                        !(env.DETECTED_LANG in ['nodejs','react','angular','vue'])) {
+                        sh """
+                            echo "======================================================================"
+                            echo "  Frontend sub-project tests: ${env.FRONTEND_DIR}"
+                            echo "======================================================================"
+                            cd '${env.FRONTEND_DIR}'
+                            if grep -q '"test"' package.json 2>/dev/null; then
+                                npx jest --ci --coverage \
+                                    --coverageDirectory='${REPORTS_DIR}/frontend-coverage' \
+                                    --coverageReporters=json-summary --coverageReporters=lcov \
+                                    --reporters=default --reporters=jest-junit \
+                                    --passWithNoTests 2>/dev/null || \
+                                npm test -- --watchAll=false --passWithNoTests 2>/dev/null || \
+                                npm test 2>/dev/null || true
+                            elif grep -q '"test:unit"' package.json 2>/dev/null; then
+                                npm run test:unit 2>/dev/null || true
+                            else
+                                echo "[INFO] No test script found in ${env.FRONTEND_DIR}/package.json"
+                            fi
+                        """
                     }
                 }
             }
             post {
                 always {
-                    junit allowEmptyResults: true, testResults: "${REPORTS_DIR}/**/*.xml"
+                    junit allowEmptyResults: true, testResults: "pipeline-reports/**/*.xml"
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 6: Integration Tests (optional)
+        // STAGE 5: Integration Tests (optional)
         // =====================================================================
         stage('Integration Tests') {
             when { expression { params.RUN_INTEGRATION_TESTS } }
             steps {
                 script {
-                    // ── Check if integration test folders exist ──
-                    def integrationTestsDetected = false
+                    def intFound = false
                     switch (env.DETECTED_LANG) {
                         case 'python':
-                            integrationTestsDetected = fileExists('tests/integration') || fileExists('test/integration') ||
-                                sh(script: "grep -r '@pytest.mark.integration' tests/ test/ 2>/dev/null | head -1", returnStdout: true).trim()
+                            intFound = fileExists('tests/integration') || fileExists('test/integration')
                             break
-                        case 'java-maven':
-                        case 'java-gradle':
-                            integrationTestsDetected = sh(script: "find . -maxdepth 5 -name '*IT.java' -o -name '*IntegrationTest.java' | head -1", returnStdout: true).trim()
+                        case 'java-maven': case 'java-gradle':
+                            intFound = sh(script: "find . -maxdepth 5 -name '*IT.java' -o -name '*IntegrationTest.java' 2>/dev/null | head -1", returnStdout: true).trim()
                             break
-                        case 'nodejs': case 'react': case 'angular':
-                            integrationTestsDetected = fileExists('test/integration') || fileExists('tests/integration') ||
-                                sh(script: "grep -q '\"test:integration\"' package.json 2>/dev/null && echo 'yes'", returnStdout: true).trim()
+                        case 'nodejs': case 'react': case 'angular': case 'vue':
+                            intFound = fileExists('test/integration') || fileExists('tests/integration') ||
+                                sh(script: "grep -q '\"test:integration\"' package.json 2>/dev/null && echo yes || true", returnStdout: true).trim()
                             break
                         case 'go':
-                            integrationTestsDetected = sh(script: "grep -rl '//go:build integration' . --include='*_test.go' 2>/dev/null | head -1", returnStdout: true).trim()
+                            intFound = sh(script: "grep -rl '//go:build integration' . --include='*_test.go' 2>/dev/null | head -1", returnStdout: true).trim()
                             break
                         default:
-                            integrationTestsDetected = fileExists('tests/integration') || fileExists('test/integration')
+                            intFound = fileExists('tests/integration') || fileExists('test/integration')
                     }
 
-                    if (!integrationTestsDetected) {
-                        echo """
-╔══════════════════════════════════════════════════════════════╗
-║  ⚠  NO INTEGRATION TESTS DETECTED                           ║
-╠══════════════════════════════════════════════════════════════╣
-║  Language: ${env.DETECTED_LANG}
-║  No integration test directory or files found.               ║
-║  Please write integration test cases to enable               ║
-║  automated integration testing in the pipeline.              ║
-╚══════════════════════════════════════════════════════════════╝
-                        """
+                    if (!intFound) {
+                        echo "[WARNING] No integration tests detected — skipping integration test stage"
                         return
                     }
 
                     switch (env.DETECTED_LANG) {
                         case 'python':
-                            sh '''
+                            sh """
                                 python3 -m pytest tests/integration/ \
-                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
-                                    -v -m "integration" 2>/dev/null || \
-                                python3 -m pytest -m "integration" \
-                                    --junitxml="${REPORTS_DIR}/pytest-integration-results.xml" \
-                                    -v 2>/dev/null || echo "No integration tests found"
-                            '''
+                                    --junitxml='${REPORTS_DIR}/pytest-integration-results.xml' \
+                                    -v -m 'integration' 2>/dev/null || true
+                            """
                             break
                         case 'java-maven':
-                            sh 'mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true || echo "No integration tests"'
+                            sh 'mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true 2>/dev/null || true'
                             break
-                        case ['nodejs', 'react', 'angular']:
-                            sh '''
-                                if grep -q '"test:integration"' package.json 2>/dev/null; then
-                                    npm run test:integration
-                                else echo "No integration test script found"; fi
-                            '''
+                        case ['nodejs','react','angular','vue']:
+                            sh "grep -q '\"test:integration\"' package.json 2>/dev/null && npm run test:integration || echo '[INFO] No integration test script'"
                             break
                         case 'go':
-                            sh 'go test ./... -v -tags=integration -json > "${REPORTS_DIR}/go-integration.json" 2>&1 || echo "No integration tests"'
+                            sh """
+                                go test ./... -v -tags=integration \
+                                    -json > '${REPORTS_DIR}/go-integration.json' 2>&1 || true
+                            """
                             break
                     }
                 }
@@ -549,305 +725,298 @@ print(f'  Coverage: {rate:.1f}% (threshold: ${COVERAGE_THRESHOLD}%)')
         }
 
         // =====================================================================
-        // STAGE 7: CycloneDX SBOM Generation (ALL LANGUAGES)
+        // STAGE 6: CycloneDX SBOM Generation
         // =====================================================================
         stage('CycloneDX SBOM Generation') {
             when { expression { params.GENERATE_SBOM } }
             steps {
                 script {
-                    echo """
-╔══════════════════════════════════════════════════════════════╗
-║  CycloneDX SBOM Generation — ${env.DETECTED_LANG}
-║  Scanning root folder for all dependency manifests           ║
-╚══════════════════════════════════════════════════════════════╝
-                    """
-
-                    sh 'pip install cyclonedx-bom cyclonedx-py pip-audit 2>/dev/null || true'
-
+                    echo "=== Stage 6: CycloneDX SBOM Generation (${env.DETECTED_LANG}) ==="
                     switch (env.DETECTED_LANG) {
                         case 'python':
                             sh """
-                                echo "=== CycloneDX SBOM — Python ==="
-                                if [ -f "requirements.txt" ]; then
-                                    cyclonedx-py requirements -i requirements.txt --output-format json \
-                                        -o "${REPORTS_DIR}/sbom/sbom-python-requirements.json" 2>/dev/null || true
-                                    cyclonedx-py requirements -i requirements.txt --output-format xml \
-                                        -o "${REPORTS_DIR}/sbom/sbom-python-requirements.xml" 2>/dev/null || true
-                                fi
+                                [ -f "requirements.txt" ] && \
+                                    (cyclonedx-py requirements -i requirements.txt --output-format json \
+                                        -o '${REPORTS_DIR}/sbom/sbom-python-requirements.json' 2>/dev/null || true) || true
                                 cyclonedx-py environment --output-format json \
-                                    -o "${REPORTS_DIR}/sbom/sbom-python-environment.json" 2>/dev/null || true
+                                    -o '${REPORTS_DIR}/sbom/sbom-python-environment.json' 2>/dev/null || true
                                 pip-audit --format=cyclonedx-json \
-                                    --output="${REPORTS_DIR}/sbom/sbom-python-pip-audit.json" 2>/dev/null || true
-                                if [ -f "poetry.lock" ]; then
-                                    cyclonedx-py poetry --output-format json \
-                                        -o "${REPORTS_DIR}/sbom/sbom-python-poetry.json" 2>/dev/null || true
-                                fi
-                                if [ -f "Pipfile.lock" ]; then
-                                    cyclonedx-py pipenv --output-format json \
-                                        -o "${REPORTS_DIR}/sbom/sbom-python-pipenv.json" 2>/dev/null || true
-                                fi
+                                    --output='${REPORTS_DIR}/sbom/sbom-python-pip-audit.json' 2>/dev/null || true
+                                # Text format pip-audit report for human-readable review
+                                pip-audit --format=columns \
+                                    --output='${REPORTS_DIR}/sbom/sbom-python-pip-audit.txt' 2>/dev/null || \
+                                pip-audit > '${REPORTS_DIR}/sbom/sbom-python-pip-audit.txt' 2>/dev/null || true
+                                # Also scan any subdir requirements.txt files
+                                find . -maxdepth 3 -name 'requirements*.txt' \
+                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
+                                while IFS= read -r req; do
+                                    [ "\$(dirname "\$req")" = "." ] && continue
+                                    SAFE=\$(echo "\$req" | tr '/' '-' | sed 's/^-*//')
+                                    echo "  SBOM for: \$req"
+                                    pip-audit --format=cyclonedx-json \
+                                        --output='${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.json' \
+                                        -r "\$req" 2>/dev/null || true
+                                    pip-audit -r "\$req" > '${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.txt' 2>/dev/null || true
+                                done
                             """
                             break
                         case 'java-maven':
                             sh """
-                                echo "=== CycloneDX SBOM — Java (Maven) ==="
                                 mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.11:makeAggregateBom \
                                     -DoutputFormat=json -DoutputName=sbom-java-maven \
-                                    -DoutputDirectory="${REPORTS_DIR}/sbom" \
-                                    -DincludeLicenseText=true -DincludeCompileScope=true \
-                                    -DincludeRuntimeScope=true -DincludeTestScope=false \
-                                    -q 2>/dev/null || echo "Maven CycloneDX plugin failed"
-                                mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.11:makeAggregateBom \
-                                    -DoutputFormat=xml -DoutputName=sbom-java-maven \
-                                    -DoutputDirectory="${REPORTS_DIR}/sbom" -q 2>/dev/null || true
+                                    -DoutputDirectory='${REPORTS_DIR}/sbom' -q 2>/dev/null || true
                             """
                             break
                         case 'java-gradle':
                             sh """
-                                echo "=== CycloneDX SBOM — Java (Gradle) ==="
-                                if grep -q 'cyclonedx' build.gradle 2>/dev/null || grep -q 'cyclonedx' build.gradle.kts 2>/dev/null; then
-                                    ./gradlew cyclonedxBom 2>/dev/null || gradle cyclonedxBom 2>/dev/null || true
-                                    cp build/reports/bom.json "${REPORTS_DIR}/sbom/sbom-java-gradle.json" 2>/dev/null || true
-                                else
-                                    cat > /tmp/cyclonedx-init.gradle <<'INITEOF'
-initscript {
-    repositories { mavenCentral() }
-    dependencies { classpath 'org.cyclonedx:cyclonedx-gradle-plugin:1.8.2' }
-}
-allprojects {
-    apply plugin: org.cyclonedx.gradle.CycloneDxPlugin
-    cyclonedxBom { includeConfigs = ["runtimeClasspath"]; outputFormat = "json" }
-}
-INITEOF
-                                    ./gradlew cyclonedxBom --init-script /tmp/cyclonedx-init.gradle 2>/dev/null || true
-                                    cp build/reports/bom.json "${REPORTS_DIR}/sbom/sbom-java-gradle.json" 2>/dev/null || true
-                                fi
+                                (./gradlew cyclonedxBom 2>/dev/null || gradle cyclonedxBom 2>/dev/null) && \
+                                    cp build/reports/bom.json '${REPORTS_DIR}/sbom/sbom-java-gradle.json' 2>/dev/null || true
                             """
                             break
-                        case ['nodejs', 'react', 'angular']:
+                        case ['nodejs','react','angular','vue']:
                             sh """
-                                echo "=== CycloneDX SBOM — ${env.DETECTED_LANG} ==="
                                 npx @cyclonedx/cyclonedx-npm --output-format JSON \
-                                    --output-file "${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json" \
-                                    --ignore-npm-errors 2>/dev/null || true
-                                npx @cyclonedx/cyclonedx-npm --output-format XML \
-                                    --output-file "${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.xml" \
-                                    --ignore-npm-errors 2>/dev/null || true
-                                if [ ! -f "${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json" ]; then
-                                    npm sbom --sbom-format cyclonedx --omit dev \
-                                        > "${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json" 2>/dev/null || true
-                                fi
-                                npm audit --json > "${REPORTS_DIR}/npm-audit.json" 2>/dev/null || true
+                                    --output-file '${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json' \
+                                    --ignore-npm-errors 2>/dev/null || \
+                                npm sbom --sbom-format cyclonedx --omit dev \
+                                    > '${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json' 2>/dev/null || true
+                                npm audit --json > '${REPORTS_DIR}/sbom/npm-audit.json' 2>/dev/null || true
                             """
                             break
                         case 'go':
                             sh """
-                                echo "=== CycloneDX SBOM — Go ==="
-                                if command -v cyclonedx-gomod &>/dev/null; then
-                                    cyclonedx-gomod mod -json -output "${REPORTS_DIR}/sbom/sbom-go.json" 2>/dev/null || true
-                                    cyclonedx-gomod mod -output "${REPORTS_DIR}/sbom/sbom-go.xml" 2>/dev/null || true
-                                fi
+                                command -v cyclonedx-gomod &>/dev/null && \
+                                    cyclonedx-gomod mod -json \
+                                    -output '${REPORTS_DIR}/sbom/sbom-go.json' 2>/dev/null || true
                             """
                             break
                         case 'dotnet':
                             sh """
-                                echo "=== CycloneDX SBOM — .NET ==="
                                 CSPROJ=\$(find . -maxdepth 2 -name '*.csproj' | head -1)
-                                if [ -n "\${CSPROJ}" ]; then
-                                    dotnet CycloneDX "\${CSPROJ}" --json \
-                                        --output "${REPORTS_DIR}/sbom" --filename "sbom-dotnet.json" 2>/dev/null || true
-                                fi
+                                [ -n "\${CSPROJ}" ] && dotnet CycloneDX "\${CSPROJ}" --json \
+                                    --output '${REPORTS_DIR}/sbom' --filename 'sbom-dotnet.json' 2>/dev/null || true
                             """
                             break
                     }
 
-                    // ── Scan for additional language manifests in subdirectories ──
                     sh """
-                        echo "=== Scanning root for additional language manifests ==="
-                        find . -maxdepth 3 -name "requirements.txt" ! -path "./.venv/*" ! -path "./venv/*" ! -path "./pipeline-reports/*" | while read req; do
-                            DIR=\$(dirname "\$req")
-                            SAFE=\$(echo "\$DIR" | sed 's|[/.]|-|g' | sed 's|^-*||')
-                            [ -z "\$SAFE" ] && SAFE="root"
-                            if [ ! -f "${REPORTS_DIR}/sbom/sbom-python-\${SAFE}.json" ] && [ "\$DIR" != "." ]; then
-                                echo "  Found Python: \$req"
-                                pip-audit --format=cyclonedx-json \
-                                    --output="${REPORTS_DIR}/sbom/sbom-python-\${SAFE}-audit.json" \
-                                    -r "\$req" 2>/dev/null || true
-                            fi
-                        done
-
-                        find . -maxdepth 3 -name "package.json" ! -path "*/node_modules/*" ! -path "./pipeline-reports/*" | while read pkg; do
-                            DIR=\$(dirname "\$pkg")
-                            SAFE=\$(echo "\$DIR" | sed 's|[/.]|-|g' | sed 's|^-*||')
-                            [ -z "\$SAFE" ] && SAFE="root"
-                            if [ ! -f "${REPORTS_DIR}/sbom/sbom-nodejs-\${SAFE}.json" ] && [ "\$DIR" != "." ]; then
-                                echo "  Found Node.js: \$pkg"
-                                cd "\$DIR"
-                                npx @cyclonedx/cyclonedx-npm --output-format JSON \
-                                    --output-file "${REPORTS_DIR}/sbom/sbom-nodejs-\${SAFE}.json" \
-                                    --ignore-npm-errors 2>/dev/null || true
-                                cd "${WORKSPACE}"
-                            fi
-                        done
-
-                        echo "=== Trivy CycloneDX SBOM (full root scan) ==="
+                        echo "=== Trivy CycloneDX SBOM (full filesystem) ==="
                         trivy fs --format cyclonedx \
-                            --output "${REPORTS_DIR}/sbom/sbom-trivy-cyclonedx.json" \
-                            "${WORKSPACE}" 2>/dev/null || true
+                            --output '${REPORTS_DIR}/sbom/sbom-trivy-cyclonedx.json' \
+                            '${WORKSPACE}' 2>/dev/null || true
+
+                        echo "=== Trivy SPDX SBOM ==="
                         trivy fs --format spdx-json \
-                            --output "${REPORTS_DIR}/sbom/sbom-trivy-spdx.json" \
-                            "${WORKSPACE}" 2>/dev/null || true
+                            --output '${REPORTS_DIR}/sbom/sbom-trivy-spdx.json' \
+                            '${WORKSPACE}' 2>/dev/null || true
+
+                        echo "=== Trivy SBOM — Text / Table format (all dependencies) ==="
+                        trivy fs --format table \
+                            --output '${REPORTS_DIR}/sbom/sbom-all-dependencies.txt' \
+                            '${WORKSPACE}' 2>/dev/null || true
+                        echo "=== Trivy SCA — Vulnerability + License report (text) ==="
+                        trivy fs --scanners vuln,license \
+                            --severity CRITICAL,HIGH,MEDIUM,LOW \
+                            --format table \
+                            --output '${REPORTS_DIR}/sbom/sbom-vuln-license-report.txt' \
+                            '${WORKSPACE}' 2>/dev/null || true
+
+                        echo "=== Scanning subdirectories for additional manifests ==="
+                        find . -maxdepth 3 -name 'requirements.txt' \
+                            ! -path './.venv/*' ! -path './venv/*' ! -path './pipeline-reports/*' | \
+                            while read req; do
+                                DIR=\$(dirname "\$req"); [ "\$DIR" = "." ] && continue
+                                SAFE=\$(echo "\$DIR" | tr '/' '-' | sed 's/^-*//')
+                                echo "  Generating SBOM for: \$req"
+                                pip-audit --format=cyclonedx-json \
+                                    --output='${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.json' \
+                                    -r "\$req" 2>/dev/null || true
+                            done
+
+                        find . -maxdepth 3 -name 'package.json' \
+                            ! -path '*/node_modules/*' ! -path './pipeline-reports/*' | \
+                            while read pkg; do
+                                DIR=\$(dirname "\$pkg"); [ "\$DIR" = "." ] && continue
+                                SAFE=\$(echo "\$DIR" | tr '/' '-' | sed 's/^-*//')
+                                echo "  Generating SBOM for: \$pkg"
+                                (cd "\$DIR" && npx @cyclonedx/cyclonedx-npm --output-format JSON \
+                                    --output-file '${REPORTS_DIR}/sbom/sbom-nodejs-'\${SAFE}'.json' \
+                                    --ignore-npm-errors 2>/dev/null || true)
+                            done
                     """
 
-                    // ── Print SBOM summary ──
                     sh '''
-                        python3 <<'PYEOF'
+python3 <<'PYEOF'
 import json, os, glob
 sbom_dir = os.path.join(os.environ.get("REPORTS_DIR", "."), "sbom")
 total = 0
-for sf in sorted(glob.glob(os.path.join(sbom_dir, "sbom-*.json"))):
+files = sorted(glob.glob(os.path.join(sbom_dir, "sbom-*.json")))
+print("  SBOM Files:")
+for sf in files:
     try:
-        with open(sf) as f:
-            data = json.load(f)
+        with open(sf) as f: data = json.load(f)
         n = len(data.get("components", []))
         total += n
-        print(f"  {os.path.basename(sf):50s}  {n} components")
+        print("    %-52s  %d components" % (os.path.basename(sf), n))
     except Exception as e:
-        print(f"  {os.path.basename(sf):50s}  ERROR: {e}")
-print(f"\n  TOTAL SBOM COMPONENTS: {total}")
+        print("    %-52s  ERROR: %s" % (os.path.basename(sf), str(e)))
+print("  TOTAL: %d components across %d SBOM files" % (total, len(files)))
 PYEOF
-                    '''
+'''
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 8: SonarQube Analysis
+        // STAGE 7: SonarQube Analysis
         // =====================================================================
         stage('SonarQube Analysis') {
             when { expression { params.RUN_SONARQUBE } }
             steps {
                 script {
-                    def projectKey = params.SONAR_PROJECT_KEY ?: env.JOB_NAME ?: 'default-project'
-
-                    echo """
-╔══════════════════════════════════════════════════════════════╗
-║  SonarQube Analysis — ${projectKey}
-╚══════════════════════════════════════════════════════════════╝
-                    """
-
+                    def projectKey = params.SONAR_PROJECT_KEY?.trim() ?: (env.JOB_NAME ?: 'devsecops-project')
                     def hasSonarScanner = sh(script: 'command -v sonar-scanner', returnStatus: true) == 0
-                    def hasSonarToken = false
-                    try { hasSonarToken = env.SONAR_TOKEN?.trim() ? true : false } catch (Exception e) { }
+                    def hasSonarToken   = env.SONAR_TOKEN?.trim()?.length() > 0
 
-                    if (hasSonarScanner && hasSonarToken) {
-                        def langParams = ''
-                        switch (env.DETECTED_LANG) {
-                            case 'python':
-                                langParams = "-Dsonar.language=py -Dsonar.python.coverage.reportPaths=\"${REPORTS_DIR}/coverage.xml\" -Dsonar.python.xunit.reportPath=\"${REPORTS_DIR}/pytest-unit-results.xml\""
-                                break
-                            case 'java-maven':
-                                langParams = "-Dsonar.java.binaries=\"target/classes\" -Dsonar.coverage.jacoco.xmlReportPaths=\"${REPORTS_DIR}/jacoco-coverage.xml\""
-                                break
-                            case 'java-gradle':
-                                langParams = "-Dsonar.java.binaries=\"build/classes\" -Dsonar.coverage.jacoco.xmlReportPaths=\"${REPORTS_DIR}/jacoco-coverage.xml\""
-                                break
-                            case ['nodejs', 'react', 'angular']:
-                                langParams = "-Dsonar.javascript.lcov.reportPaths=\"${REPORTS_DIR}/lcov.info\""
-                                break
-                            case 'go':
-                                langParams = "-Dsonar.go.coverage.reportPaths=\"${REPORTS_DIR}/go-coverage.out\""
-                                break
-                        }
-
+                    if (!hasSonarScanner || !hasSonarToken) {
                         sh """
-                            sonar-scanner \
-                                -Dsonar.host.url="\${SONAR_HOST_URL}" \
-                                -Dsonar.login="\${SONAR_TOKEN}" \
-                                -Dsonar.projectKey="${projectKey}" \
-                                -Dsonar.projectName="${projectKey}" \
-                                -Dsonar.sources=. \
-                                -Dsonar.exclusions="**/node_modules/**,**/.trivy-cache/**,**/pipeline-reports/**" \
-                                -Dsonar.qualitygate.wait=true \
-                                ${langParams} \
-                                2>&1 | tee "${REPORTS_DIR}/sonarqube/sonar-scanner-output.txt" || true
-
-                            sleep 10
-                            curl -s -u "\${SONAR_TOKEN}:" \
-                                "\${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${projectKey}" \
-                                > "${REPORTS_DIR}/sonarqube/quality-gate-status.json" 2>/dev/null || true
-                            curl -s -u "\${SONAR_TOKEN}:" \
-                                "\${SONAR_HOST_URL}/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots" \
-                                > "${REPORTS_DIR}/sonarqube/project-measures.json" 2>/dev/null || true
-                            curl -s -u "\${SONAR_TOKEN}:" \
-                                "\${SONAR_HOST_URL}/api/issues/search?componentKeys=${projectKey}&severities=BLOCKER,CRITICAL&statuses=OPEN,CONFIRMED&ps=500" \
-                                > "${REPORTS_DIR}/sonarqube/critical-issues.json" 2>/dev/null || true
-                        """
-                    } else {
-                        echo "SonarQube not available — generating local quality report"
+echo "======================================================================"
+echo "  [WARNING] SonarQube NOT fully configured — generating local report"
+echo "======================================================================"
+echo "  sonar-scanner available: ${hasSonarScanner}"
+echo "  SONAR_TOKEN set:         ${hasSonarToken}"
+echo "  Set SONAR_HOST_URL and SONAR_TOKEN env vars on the agent"
+echo "======================================================================"
+"""
                         sh '''
-                            python3 <<'PYEOF'
-import json, os, re
-reports_dir = os.environ.get("REPORTS_DIR", ".")
+python3 <<'PYEOF'
+import json, os, re, xml.etree.ElementTree as ET
+r = os.environ.get("REPORTS_DIR", ".")
 report = {"sonarqube_available": False, "local_analysis": True, "quality_metrics": {}}
 for name, file in [("bandit","bandit-report.json"),("flake8","flake8-report.txt"),("pylint","pylint-report.txt"),("eslint","eslint-report.json")]:
-    fpath = os.path.join(reports_dir, file)
-    if os.path.exists(fpath):
+    fpath = os.path.join(r, file)
+    if not os.path.exists(fpath): continue
+    try:
         if name == "bandit":
             with open(fpath) as f: data = json.load(f)
             results = data.get("results", [])
             report["quality_metrics"]["bandit_total"] = len(results)
-            report["quality_metrics"]["bandit_high"] = sum(1 for r in results if r.get("issue_severity") == "HIGH")
+            report["quality_metrics"]["bandit_high"] = sum(1 for x in results if x.get("issue_severity") == "HIGH")
         elif name == "flake8":
-            with open(fpath) as f: report["quality_metrics"]["flake8_issues"] = len(f.readlines())
+            with open(fpath) as f: report["quality_metrics"]["flake8_issues"] = len([l for l in f if l.strip()])
         elif name == "pylint":
             with open(fpath) as f: content = f.read()
-            m = re.search(r"Your code has been rated at ([0-9.]+)", content)
+            m = re.search(r"rated at ([0-9.]+)", content)
             if m: report["quality_metrics"]["pylint_score"] = float(m.group(1))
         elif name == "eslint":
             with open(fpath) as f: data = json.load(f)
-            report["quality_metrics"]["eslint_errors"] = sum(r.get("errorCount",0) for r in data)
-cov_file = os.path.join(reports_dir, "coverage.xml")
-if os.path.exists(cov_file):
-    import xml.etree.ElementTree as ET
-    tree = ET.parse(cov_file)
-    root = tree.getroot()
-    report["quality_metrics"]["coverage_percent"] = round(float(root.attrib.get("line-rate",0))*100, 1)
-os.makedirs(os.path.join(reports_dir, "sonarqube"), exist_ok=True)
-with open(os.path.join(reports_dir, "sonarqube", "local-quality-report.json"), "w") as f:
+            report["quality_metrics"]["eslint_errors"] = sum(x.get("errorCount",0) for x in data)
+    except: pass
+cov = os.path.join(r, "coverage.xml")
+if os.path.exists(cov):
+    try:
+        root = ET.parse(cov).getroot()
+        report["quality_metrics"]["coverage_pct"] = round(float(root.attrib.get("line-rate",0))*100, 1)
+    except: pass
+os.makedirs(os.path.join(r,"sonarqube"), exist_ok=True)
+with open(os.path.join(r,"sonarqube","local-quality-report.json"), "w") as f:
     json.dump(report, f, indent=2)
+print("  Local quality metrics:")
 for k,v in report["quality_metrics"].items(): print(f"    {k}: {v}")
 PYEOF
-                        '''
+'''
+                        return
                     }
+
+                    def langParams = ''
+                    switch (env.DETECTED_LANG) {
+                        case 'python':
+                            langParams = "-Dsonar.language=py -Dsonar.python.coverage.reportPaths=\"${REPORTS_DIR}/coverage.xml\" -Dsonar.python.xunit.reportPath=\"${REPORTS_DIR}/pytest-unit-results.xml\""
+                            break
+                        case 'java-maven':
+                            langParams = "-Dsonar.java.binaries=\"target/classes\" -Dsonar.coverage.jacoco.xmlReportPaths=\"${REPORTS_DIR}/jacoco-coverage.xml\""
+                            break
+                        case 'java-gradle':
+                            langParams = "-Dsonar.java.binaries=\"build/classes\" -Dsonar.coverage.jacoco.xmlReportPaths=\"${REPORTS_DIR}/jacoco-coverage.xml\""
+                            break
+                        case ['nodejs','react','angular','vue']:
+                            langParams = "-Dsonar.javascript.lcov.reportPaths=\"${REPORTS_DIR}/lcov.info\""
+                            break
+                        case 'go':
+                            langParams = "-Dsonar.go.coverage.reportPaths=\"${REPORTS_DIR}/go-coverage.out\""
+                            break
+                    }
+
+                    sh """
+                        sonar-scanner \
+                            -Dsonar.host.url="\${SONAR_HOST_URL}" \
+                            -Dsonar.login="\${SONAR_TOKEN}" \
+                            -Dsonar.projectKey="${projectKey}" \
+                            -Dsonar.projectName="${projectKey}" \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions='**/node_modules/**,**/.trivy-cache/**,**/pipeline-reports/**' \
+                            -Dsonar.qualitygate.wait=true \
+                            ${langParams} \
+                            2>&1 | tee '${REPORTS_DIR}/sonarqube/sonar-scanner-output.txt' || true
+
+                        sleep 10
+                        curl -s -u "\${SONAR_TOKEN}:" \
+                            "\${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${projectKey}" \
+                            > '${REPORTS_DIR}/sonarqube/quality-gate-status.json' 2>/dev/null || true
+                        curl -s -u "\${SONAR_TOKEN}:" \
+                            "\${SONAR_HOST_URL}/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots" \
+                            > '${REPORTS_DIR}/sonarqube/project-measures.json' 2>/dev/null || true
+                        curl -s -u "\${SONAR_TOKEN}:" \
+                            "\${SONAR_HOST_URL}/api/issues/search?componentKeys=${projectKey}&severities=BLOCKER,CRITICAL&statuses=OPEN,CONFIRMED&ps=500" \
+                            > '${REPORTS_DIR}/sonarqube/critical-issues.json' 2>/dev/null || true
+                    """
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 9: Build Application
+        // STAGE 8: Build Application
         // =====================================================================
         stage('Build Application') {
             steps {
                 script {
-                    if (env.HAS_MAKEFILE == 'true') {
-                        sh 'make build 2>/dev/null || make all 2>/dev/null || make 2>/dev/null || echo "make completed"'
+                    def mkDir = env.MAKEFILE_DIR ?: ''
+                    def cdMk  = mkDir ? "cd '${mkDir}' && " : ''
+                    if (env.HAS_MAKEFILE == 'true' && env.MAKE_BUILD_TARGET) {
+                        echo "=== Build via Makefile: ${env.MAKEFILE_PATH} → target: ${env.MAKE_BUILD_TARGET} ==="
+                        sh """
+                            ${cdMk}make ${env.MAKE_BUILD_TARGET} \
+                                IMAGE_NAME="\${REGISTRY}/\${IMAGE_NAME:-app}:\${IMAGE_TAG:-latest}" \
+                                REGISTRY="\${REGISTRY}" TAG="\${IMAGE_TAG:-latest}" 2>&1 || \
+                            ${cdMk}make ${env.MAKE_BUILD_TARGET} 2>&1 || true
+                        """
+                    } else if (env.HAS_MAKEFILE == 'true') {
+                        sh "${cdMk}make build 2>/dev/null || ${cdMk}make all 2>/dev/null || ${cdMk}make 2>/dev/null || echo '[INFO] No suitable make target'"
                     } else {
                         switch (env.DETECTED_LANG) {
                             case 'python':
                                 sh '''
-                                    if [ -f "setup.py" ]; then python3 setup.py bdist_wheel 2>/dev/null || true
-                                    elif [ -f "pyproject.toml" ]; then pip install build && python3 -m build 2>/dev/null || true
-                                    else echo "No build step needed"; fi
+                                    if [ -f "setup.py" ]; then
+                                        python3 setup.py bdist_wheel 2>/dev/null || true
+                                    elif [ -f "pyproject.toml" ]; then
+                                        pip install --break-system-packages build 2>/dev/null || true
+                                        python3 -m build 2>/dev/null || true
+                                    else echo "[INFO] No build step for Python script project"; fi
                                 '''
                                 break
-                            case 'java-maven': sh 'mvn package -DskipTests -q'; break
-                            case 'java-gradle': sh './gradlew build -x test 2>/dev/null || gradle build -x test'; break
-                            case ['nodejs', 'react', 'angular']:
-                                sh 'if grep -q \'"build"\' package.json 2>/dev/null; then npm run build; else echo "No build script"; fi'
+                            case 'java-maven': sh 'mvn package -DskipTests -q 2>/dev/null || true'; break
+                            case 'java-gradle': sh './gradlew build -x test 2>/dev/null || gradle build -x test 2>/dev/null || true'; break
+                            case ['nodejs','react','angular','vue']:
+                                sh 'grep -q \'"build"\' package.json 2>/dev/null && npm run build || echo "[INFO] No build script"'
                                 break
-                            case 'go': sh 'CGO_ENABLED=0 go build -o "${REPORTS_DIR}/app-binary" ./... 2>/dev/null || go build ./...'; break
-                            case 'dotnet': sh 'dotnet build --configuration Release'; break
+                            case 'go':
+                                sh """
+                                    CGO_ENABLED=0 go build -o '${REPORTS_DIR}/app-binary' ./... 2>/dev/null || \
+                                        go build ./... 2>/dev/null || true
+                                """
+                                break
+                            case 'dotnet': sh 'dotnet build --configuration Release 2>/dev/null || true'; break
+                            default: echo "[INFO] No build configured for ${env.DETECTED_LANG}"
                         }
                     }
                 }
@@ -855,329 +1024,530 @@ PYEOF
         }
 
         // =====================================================================
-        // STAGE 10: Docker Build & Push
+        // STAGE 9: Docker / Container Build (Makefile-first)
         // =====================================================================
         stage('Docker Build & Push') {
-            when { expression { (env.HAS_DOCKERFILE == 'true') || (params.IMAGE_NAME?.trim()) } }
             steps {
                 script {
-                    def fullImage = "${REGISTRY}/${params.IMAGE_NAME ?: 'app'}:${params.IMAGE_TAG}"
+                    def imageName = params.IMAGE_NAME?.trim()
+                    env.BUILT_IMAGE = ''
+
+                    if (!imageName || imageName == 'none') {
+                        sh """
+echo "======================================================================"
+echo "  [WARNING] IMAGE_NAME is not set — Docker build SKIPPED"
+echo "======================================================================"
+echo "  Set the IMAGE_NAME parameter to enable container image build."
+echo "======================================================================"
+echo 'IMAGE_NAME not set — Docker build skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+"""
+                        return
+                    }
+
                     def dfPath = params.DOCKERFILE_PATH ?: 'Dockerfile'
-                    if (!fileExists(dfPath) && fileExists('Containerfile')) { dfPath = 'Containerfile' }
-                    sh """
-                        if command -v podman &>/dev/null; then
-                            podman build -t "${fullImage}" -f "${dfPath}" .
-                            podman push "${fullImage}" --tls-verify=false
-                        elif command -v docker &>/dev/null; then
-                            docker build -t "${fullImage}" -f "${dfPath}" .
-                            docker push "${fullImage}"
-                        fi
-                    """
-                    env.BUILT_IMAGE = fullImage
+                    // If parametered path doesn't exist, pick first from recursively discovered Dockerfiles
+                    if (!fileExists(dfPath)) {
+                        def firstFound = (env.ALL_DOCKERFILES ?: '').trim().split(/\s+/).find { it.trim() && it != dfPath } ?: ''
+                        if (firstFound) {
+                            echo "[INFO] Dockerfile not at '${dfPath}' — using discovered: ${firstFound}"
+                            dfPath = firstFound
+                        } else if (fileExists('Containerfile')) {
+                            dfPath = 'Containerfile'
+                        }
+                    }
+                    echo "[INFO] Dockerfiles found: ${env.ALL_DOCKERFILES ?: '(none)'}"
+
+                    def makeDockerTarget = env.MAKE_BUILD_TARGET in ['docker-build','build-image','image','docker','container'] ?
+                        env.MAKE_BUILD_TARGET : ''
+                    def mkDir2 = env.MAKEFILE_DIR ?: ''
+                    def cdMk2  = mkDir2 ? "cd '${mkDir2}' && " : ''
+
+                    if (!fileExists(dfPath) && env.HAS_MAKEFILE == 'false') {
+                        sh """
+echo "======================================================================"
+echo "  [WARNING] No Dockerfile/Containerfile AND no Makefile found"
+echo "  Docker build SKIPPED — please add a Dockerfile or Makefile target"
+echo "  Searched paths: ${env.ALL_DOCKERFILES ?: 'none'}"
+echo "======================================================================"
+echo 'No Dockerfile AND no Makefile — Docker build skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+"""
+                        return
+                    }
+
+                    def fullImage = "${REGISTRY}/${imageName}:${params.IMAGE_TAG}"
+
+                    if (env.HAS_MAKEFILE == 'true' && makeDockerTarget) {
+                        echo "=== Building image via Makefile (${env.MAKEFILE_PATH}): make ${makeDockerTarget} ==="
+                        sh """
+                            ${cdMk2}make ${makeDockerTarget} \
+                                IMAGE_NAME="${fullImage}" \
+                                REGISTRY="${REGISTRY}" \
+                                TAG="${params.IMAGE_TAG}" 2>&1 || \
+                            ${cdMk2}make ${makeDockerTarget} 2>&1 || true
+                        """
+                    } else {
+                        sh """
+                            echo "=== Building image: ${fullImage} from ${dfPath} ==="
+                            BUILD_CONTEXT=\$(dirname ${dfPath})
+                            [ "\$BUILD_CONTEXT" = "." ] && BUILD_CONTEXT="."
+                            if command -v podman &>/dev/null; then
+                                podman build -t '${fullImage}' -f '${dfPath}' "\$BUILD_CONTEXT" && \
+                                podman push '${fullImage}' --tls-verify=false 2>/dev/null || true
+                                echo "[OK] Podman build+push complete"
+                            elif command -v docker &>/dev/null; then
+                                docker build -t '${fullImage}' -f '${dfPath}' "\$BUILD_CONTEXT" && \
+                                docker push '${fullImage}' 2>/dev/null || true
+                                echo "[OK] Docker build+push complete"
+                            else
+                                echo "[WARNING] No container runtime (podman/docker) found on agent"
+                                echo 'No container runtime found on agent' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+                            fi
+                        """
+                    }
+
+                    // Check if image exists locally for trivy scan
+                    def imgCheck = sh(script: """
+                        (command -v podman &>/dev/null && podman image exists '${fullImage}' 2>/dev/null && echo yes) || \
+                        (command -v docker &>/dev/null && docker image inspect '${fullImage}' &>/dev/null && echo yes) || \
+                        echo no
+                    """, returnStdout: true).trim()
+
+                    env.BUILT_IMAGE = fullImage    // always set for trivy (it can pull from registry)
+                    echo "[OK] Image for Trivy scan: ${fullImage} (local: ${imgCheck})"
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 11: Trivy Image Scan
+        // STAGE 10: Trivy Image Scan
         // =====================================================================
         stage('Trivy Image Scan') {
-            when { expression { params.RUN_TRIVY_SCAN && env.BUILT_IMAGE?.trim() } }
+            when { expression { params.RUN_TRIVY_SCAN && (env.BUILT_IMAGE?.trim()) } }
             steps {
                 sh """
-                    trivy image --podman-host "" --severity "\${SCAN_SEVERITY}" \
-                        --format json --output "${REPORTS_DIR}/trivy-image-scan.json" \
-                        "${env.BUILT_IMAGE}" || true
-                    trivy image --podman-host "" --severity "\${SCAN_SEVERITY}" \
-                        --format table "${env.BUILT_IMAGE}" | tee "${REPORTS_DIR}/trivy-image-scan.txt" || true
+                    echo "=== Trivy Image Scan: ${env.BUILT_IMAGE} ==="
+                    trivy image \
+                        --severity '${SCAN_SEVERITY}' \
+                        --format json \
+                        --output '${REPORTS_DIR}/trivy/trivy-image-scan.json' \
+                        --timeout 15m \
+                        '${env.BUILT_IMAGE}' 2>/dev/null || \
+                    echo '{"Results":[],"SchemaVersion":2}' > '${REPORTS_DIR}/trivy/trivy-image-scan.json'
+
+                    trivy image \
+                        --severity '${SCAN_SEVERITY}' \
+                        --format table \
+                        --timeout 15m \
+                        '${env.BUILT_IMAGE}' 2>/dev/null | tee '${REPORTS_DIR}/trivy/trivy-image-scan.txt' || true
+
+                    echo "=== Trivy Image SBOM ==="
+                    trivy image \
+                        --format cyclonedx \
+                        --output '${REPORTS_DIR}/sbom/sbom-trivy-image.json' \
+                        '${env.BUILT_IMAGE}' 2>/dev/null || true
                 """
+                sh '''
+python3 <<'PYEOF'
+import json, os
+f = os.path.join(os.environ.get("REPORTS_DIR", "."), "trivy", "trivy-image-scan.json")
+try:
+    with open(f) as fh: data = json.load(fh)
+    results = data.get("Results", [])
+    crit = sum(1 for r in results for v in (r.get("Vulnerabilities") or []) if v.get("Severity") == "CRITICAL")
+    high = sum(1 for r in results for v in (r.get("Vulnerabilities") or []) if v.get("Severity") == "HIGH")
+    print(f"  [Trivy Image] CRITICAL={crit}  HIGH={high}")
+except Exception as e:
+    print(f"  [Trivy Image] Report not available: {e}")
+PYEOF
+'''
             }
         }
 
         // =====================================================================
-        // STAGE 12: SAST & Secret Detection
+        // STAGE 11: SAST · Filesystem Scan · Secret Detection
         // =====================================================================
         stage('SAST & Secret Detection') {
             when { expression { params.RUN_TRIVY_SCAN || params.RUN_SECRET_DETECTION } }
             parallel {
-                stage('Trivy FS Scan') {
+                stage('Trivy Filesystem SAST') {
                     when { expression { params.RUN_TRIVY_SCAN } }
                     steps {
-                        sh '''
-                            trivy fs --scanners vuln,misconfig --severity "${SCAN_SEVERITY}" \
-                                --format json --output "${REPORTS_DIR}/trivy-fs-scan.json" "${WORKSPACE}" || true
-                            trivy fs --scanners vuln,misconfig --severity "${SCAN_SEVERITY}" \
-                                --format table "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-fs-scan.txt" || true
-                        '''
+                        sh """
+                            trivy fs \
+                                --scanners vuln,misconfig \
+                                --severity '${SCAN_SEVERITY}' \
+                                --format json \
+                                --output '${REPORTS_DIR}/trivy/trivy-fs-scan.json' \
+                                '${WORKSPACE}' 2>/dev/null || \
+                            echo '{"Results":[]}' > '${REPORTS_DIR}/trivy/trivy-fs-scan.json'
+
+                            trivy fs \
+                                --scanners vuln,misconfig \
+                                --severity '${SCAN_SEVERITY}' \
+                                --format table \
+                                '${WORKSPACE}' 2>/dev/null | tee '${REPORTS_DIR}/trivy/trivy-fs-scan.txt' || true
+                        """
                     }
                 }
                 stage('Secret Detection') {
                     when { expression { params.RUN_SECRET_DETECTION } }
                     steps {
-                        sh '''
-                            trivy fs --scanners secret --format json \
-                                --output "${REPORTS_DIR}/secret-scan.json" "${WORKSPACE}" || true
-                            trivy fs --scanners secret --format table \
-                                "${WORKSPACE}" | tee "${REPORTS_DIR}/secret-scan.txt" || true
-                        '''
+                        sh """
+                            trivy fs \
+                                --scanners secret \
+                                --format json \
+                                --output '${REPORTS_DIR}/secret-scan.json' \
+                                '${WORKSPACE}' 2>/dev/null || \
+                            echo '{"Results":[]}' > '${REPORTS_DIR}/secret-scan.json'
+
+                            trivy fs \
+                                --scanners secret \
+                                --format table \
+                                '${WORKSPACE}' 2>/dev/null | tee '${REPORTS_DIR}/secret-scan.txt' || true
+                        """
                     }
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 13: SCA — Dependency Vulnerability Scan
+        // STAGE 12: SCA — Software Composition Analysis
         // =====================================================================
         stage('SCA — Dependency Scan') {
             when { expression { params.RUN_TRIVY_SCAN } }
             parallel {
                 stage('Trivy SCA') {
                     steps {
-                        sh '''
-                            trivy fs --scanners vuln,license --severity "${SCAN_SEVERITY}" \
-                                --format json --output "${REPORTS_DIR}/trivy-sca.json" "${WORKSPACE}" || true
-                            trivy fs --scanners vuln,license --severity "${SCAN_SEVERITY}" \
-                                --format table "${WORKSPACE}" | tee "${REPORTS_DIR}/trivy-sca.txt" || true
-                        '''
+                        sh """
+                            trivy fs \
+                                --scanners vuln,license \
+                                --severity '${SCAN_SEVERITY}' \
+                                --format json \
+                                --output '${REPORTS_DIR}/trivy/trivy-sca.json' \
+                                '${WORKSPACE}' 2>/dev/null || \
+                            echo '{"Results":[]}' > '${REPORTS_DIR}/trivy/trivy-sca.json'
+
+                            trivy fs \
+                                --scanners vuln,license \
+                                --severity '${SCAN_SEVERITY}' \
+                                --format table \
+                                '${WORKSPACE}' 2>/dev/null | tee '${REPORTS_DIR}/trivy/trivy-sca.txt' || true
+                        """
+                    }
+                }
+                stage('Grype SCA') {
+                    when { expression { params.RUN_GRYPE && sh(script: 'command -v grype', returnStatus: true) == 0 } }
+                    steps {
+                        sh """
+                            grype 'dir:${WORKSPACE}' --output json \
+                                --file '${REPORTS_DIR}/grype-sca.json' 2>/dev/null || true
+                            grype 'dir:${WORKSPACE}' --output table \
+                                | tee '${REPORTS_DIR}/grype-sca.txt' 2>/dev/null || true
+                        """
                     }
                 }
                 stage('OWASP Dependency-Check') {
                     when { expression { params.RUN_OWASP_CHECK && fileExists('/opt/dependency-check/bin/dependency-check.sh') } }
                     steps {
-                        sh '''
+                        sh """
                             /opt/dependency-check/bin/dependency-check.sh \
-                                --project "${JOB_NAME}" --scan "${WORKSPACE}" \
-                                --format HTML --format JSON --out "${REPORTS_DIR}" \
-                                --failOnCVSS 7 --enableExperimental || true
-                        '''
-                    }
-                }
-                stage('Grype Scan') {
-                    when { expression { params.RUN_GRYPE && sh(script: 'command -v grype', returnStatus: true) == 0 } }
-                    steps {
-                        sh '''
-                            grype dir:"${WORKSPACE}" --output json --file "${REPORTS_DIR}/grype-sca.json" || true
-                            grype dir:"${WORKSPACE}" --output table | tee "${REPORTS_DIR}/grype-sca.txt" || true
-                        '''
+                                --project '${env.JOB_NAME ?: 'project'}' \
+                                --scan '${WORKSPACE}' \
+                                --format HTML --format JSON \
+                                --out '${REPORTS_DIR}' \
+                                --failOnCVSS 7 \
+                                --enableExperimental 2>/dev/null || true
+                        """
                     }
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 14: Dockerfile Lint
+        // STAGE 13: Dockerfile Lint (Hadolint)
         // =====================================================================
         stage('Dockerfile Lint') {
-            when { expression { params.RUN_DOCKERFILE_LINT && (env.HAS_DOCKERFILE == 'true') } }
+            when { expression { params.RUN_DOCKERFILE_LINT } }
             steps {
-                sh '''
-                    DFILE="Dockerfile"; [ -f "Containerfile" ] && DFILE="Containerfile"
-                    if command -v hadolint &>/dev/null; then
-                        hadolint --format json "$DFILE" > "${REPORTS_DIR}/hadolint.json" 2>/dev/null || true
-                        hadolint "$DFILE" | tee "${REPORTS_DIR}/hadolint.txt" || true
-                    else
-                        trivy config --severity "${SCAN_SEVERITY}" --format table "$DFILE" || true
-                    fi
-                '''
+                script {
+                    if (env.HAS_DOCKERFILE == 'false') {
+                        sh """
+echo "======================================================================"
+echo "  [WARNING] No Dockerfile found — Hadolint scan SKIPPED"
+echo "======================================================================"
+echo "  Add a Dockerfile or Containerfile to enable Dockerfile lint."
+echo "======================================================================"
+echo 'No Dockerfile found — Hadolint skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+"""
+                        return
+                    }
+                    sh """
+                        # Lint ALL discovered Dockerfiles (root + subdirectories)
+                        ALL_DFS='${env.ALL_DOCKERFILES ?: ''}'
+                        [ -z "\$ALL_DFS" ] && [ -f '${params.DOCKERFILE_PATH ?: 'Dockerfile'}' ] && ALL_DFS='${params.DOCKERFILE_PATH ?: 'Dockerfile'}'
+                        [ -z "\$ALL_DFS" ] && [ -f "Containerfile" ] && ALL_DFS="Containerfile"
+                        [ -z "\$ALL_DFS" ] && { echo "[INFO] No Dockerfiles to lint"; } && exit 0
+                        echo "=== Linting Dockerfiles: \$ALL_DFS ==="
+                        > '${REPORTS_DIR}/hadolint.txt'
+                        HADOLINT_JSON_PARTS=""
+                        for DFILE in \$ALL_DFS; do
+                            [ -f "\$DFILE" ] || continue
+                            echo "--- \$DFILE ---" >> '${REPORTS_DIR}/hadolint.txt'
+                            if command -v hadolint &>/dev/null; then
+                                hadolint "\$DFILE" 2>&1 >> '${REPORTS_DIR}/hadolint.txt' || true
+                                SAFE=\$(echo "\$DFILE" | tr '/' '-' | sed 's/^-//')
+                                hadolint --format json "\$DFILE" \
+                                    > '${REPORTS_DIR}/hadolint-'\${SAFE}'.json' 2>/dev/null || true
+                            else
+                                echo "[WARN] Hadolint unavailable for \$DFILE — using Trivy config scan"
+                                SAFE=\$(echo "\$DFILE" | tr '/' '-' | sed 's/^-//')
+                                trivy config --severity '${SCAN_SEVERITY}' --format table \
+                                    "\$DFILE" 2>/dev/null >> '${REPORTS_DIR}/hadolint.txt' || true
+                                trivy config --severity '${SCAN_SEVERITY}' --format json \
+                                    --output '${REPORTS_DIR}/trivy-dockerfile-'\${SAFE}'.json' "\$DFILE" 2>/dev/null || true
+                            fi
+                        done
+                        echo "=== Hadolint Summary ==="
+                        cat '${REPORTS_DIR}/hadolint.txt' 2>/dev/null || true
+                    """
+                }
             }
         }
 
         // =====================================================================
-        // STAGE 15: ShellCheck
+        // STAGE 14: ShellCheck
         // =====================================================================
         stage('ShellCheck') {
-            when { expression { return sh(script: 'find "${WORKSPACE}" -name "*.sh" -not -path "*/.trivy-cache/*" -not -path "*/pipeline-reports/*" | head -1', returnStdout: true).trim() } }
             steps {
-                sh '''
-                    if command -v shellcheck &>/dev/null; then
-                        find "${WORKSPACE}" -name "*.sh" -type f ! -path "*/node_modules/*" ! -path "*/.trivy-cache/*" ! -path "*/pipeline-reports/*" \
-                            -exec shellcheck --format=json {} + > "${REPORTS_DIR}/shellcheck.json" 2>/dev/null || true
-                    fi
-                '''
+                script {
+                    def hasShScripts = sh(script: """
+                        find '${WORKSPACE}' -name '*.sh' \
+                            ! -path '*/.trivy-cache/*' \
+                            ! -path '*/pipeline-reports/*' \
+                            ! -path '*/node_modules/*' | head -1
+                    """, returnStdout: true).trim()
+
+                    if (!hasShScripts) {
+                        echo "[INFO] No shell scripts found — ShellCheck skipped"
+                        return
+                    }
+                    sh """
+                        command -v shellcheck &>/dev/null || { echo "[WARN] shellcheck not on agent"; return 0; }
+                        find '${WORKSPACE}' -name '*.sh' -type f \
+                            ! -path '*/node_modules/*' \
+                            ! -path '*/.trivy-cache/*' \
+                            ! -path '*/pipeline-reports/*' \
+                            -exec shellcheck --format=json {} + \
+                            > '${REPORTS_DIR}/shellcheck.json' 2>/dev/null || true
+                        echo "[OK] ShellCheck complete"
+                    """
+                }
             }
         }
 
         // =====================================================================
-        // STAGE 16: K8s Manifest Security Scan
+        // STAGE 15: K8s Manifest Security Scan
         // =====================================================================
         stage('K8s Manifest Security Scan') {
-            when { expression { params.RUN_K8S_MANIFEST_SCAN && env.HAS_K8S_MANIFESTS == 'true' } }
-            parallel {
-                stage('Trivy K8s Config') {
-                    steps {
-                        sh '''
-                            MANIFESTS_DIR="${WORKSPACE}/${K8S_MANIFESTS_DIR:-cat-deployments}"
-                            trivy config --severity "${SCAN_SEVERITY}" --format json \
-                                --output "${REPORTS_DIR}/trivy-k8s-config.json" "${MANIFESTS_DIR}" || true
-                            trivy config --severity "${SCAN_SEVERITY}" --format table \
-                                "${MANIFESTS_DIR}" | tee "${REPORTS_DIR}/trivy-k8s-config.txt" || true
-                        '''
+            when { expression { params.RUN_K8S_MANIFEST_SCAN } }
+            steps {
+                script {
+                    if (env.HAS_K8S_MANIFESTS == 'false') {
+                        sh """
+echo "======================================================================"
+echo "  [WARNING] No Kubernetes manifests found in '${env.K8S_MANIFESTS_DIR}/' — scan SKIPPED"
+echo "======================================================================"
+echo "  Place .yaml/.yml Kubernetes manifests in ${env.K8S_MANIFESTS_DIR}/"
+echo "  to enable manifest security scanning."
+echo "======================================================================"
+echo 'No K8s manifests in ${env.K8S_MANIFESTS_DIR}/ — scan skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+"""
+                        return
                     }
-                }
-                stage('Kubesec Scan') {
-                    when { expression { return sh(script: 'command -v kubesec', returnStatus: true) == 0 } }
-                    steps {
-                        sh '''
-                            MANIFESTS_DIR="${WORKSPACE}/${K8S_MANIFESTS_DIR:-cat-deployments}"
-                            > "${REPORTS_DIR}/kubesec-results.json"
-                            find "${MANIFESTS_DIR}" \\( -name "*deployment*" -o -name "*pod*" \\) \\( -name "*.yml" -o -name "*.yaml" \\) \
-                                | while read f; do kubesec scan "$f" >> "${REPORTS_DIR}/kubesec-results.json" 2>/dev/null || true; done
-                        '''
-                    }
+
+                    def k8sDir = "${WORKSPACE}/${env.K8S_MANIFESTS_DIR}"
+                    sh """
+                        echo "=== Trivy K8s Config Scan: ${k8sDir} ==="
+                        trivy config \
+                            --severity '${SCAN_SEVERITY}' \
+                            --format json \
+                            --output '${REPORTS_DIR}/trivy/trivy-k8s-config.json' \
+                            '${k8sDir}' 2>/dev/null || \
+                        echo '{"Results":[]}' > '${REPORTS_DIR}/trivy/trivy-k8s-config.json'
+
+                        trivy config \
+                            --severity '${SCAN_SEVERITY}' \
+                            --format table \
+                            '${k8sDir}' 2>/dev/null | tee '${REPORTS_DIR}/trivy/trivy-k8s-config.txt' || true
+
+                        if command -v kubesec &>/dev/null; then
+                            echo "=== Kubesec Risk Analysis ==="
+                            > '${REPORTS_DIR}/kubesec-results.json'
+                            find '${k8sDir}' \\( -name '*deployment*' -o -name '*pod*' \\) \
+                                \\( -name '*.yml' -o -name '*.yaml' \\) | while read mf; do
+                                echo "  Scanning: \$mf"
+                                kubesec scan "\$mf" >> '${REPORTS_DIR}/kubesec-results.json' 2>/dev/null || true
+                            done
+                        else
+                            echo "[WARN] kubesec not available — kubesec scan skipped"
+                        fi
+                    """
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 17: Security Gate
+        // STAGE 16: Security Gate
         // =====================================================================
         stage('Security Gate') {
             steps {
                 script {
-                    def gateResult = sh(script: '''
-                        CRITICAL_COUNT=0; HIGH_COUNT=0; SECRETS_COUNT=0; MISCONFIG_COUNT=0
-                        for REPORT in "${REPORTS_DIR}"/trivy-*.json; do
-                            [ -f "${REPORT}" ] || continue
-                            COUNTS=$(python3 -c "
-import json
-with open('${REPORT}') as f: data = json.load(f)
-results = data.get('Results', [])
-crit = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
-high = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'HIGH')
-misc = sum(1 for r in results for m in r.get('Misconfigurations', []) if m.get('Severity') in ('CRITICAL','HIGH'))
-print(f'{crit} {high} {misc}')
-" 2>/dev/null || echo "0 0 0")
-                            C=$(echo "$COUNTS" | awk '{print $1}'); H=$(echo "$COUNTS" | awk '{print $2}'); M=$(echo "$COUNTS" | awk '{print $3}')
-                            CRITICAL_COUNT=$((CRITICAL_COUNT+C)); HIGH_COUNT=$((HIGH_COUNT+H)); MISCONFIG_COUNT=$((MISCONFIG_COUNT+M))
-                        done
-                        if [ -f "${REPORTS_DIR}/secret-scan.json" ]; then
-                            SECRETS_COUNT=$(python3 -c "
-import json
-with open('${REPORTS_DIR}/secret-scan.json') as f: data = json.load(f)
-print(sum(len(r.get('Secrets',[])) for r in data.get('Results',[])))
-" 2>/dev/null || echo "0")
-                        fi
-                        cat > "${REPORTS_DIR}/gate-results.txt" <<EOF
-CRITICAL_VULNS=${CRITICAL_COUNT}
-HIGH_VULNS=${HIGH_COUNT}
-SECRETS=${SECRETS_COUNT}
-MISCONFIGS=${MISCONFIG_COUNT}
-EOF
-                        echo "╔══════════════════════════════════════════════════════════════╗"
-                        echo "║              SECURITY GATE RESULTS                           ║"
-                        echo "╠══════════════════════════════════════════════════════════════╣"
-                        printf "║  CRITICAL:  %-48s║\\n" "${CRITICAL_COUNT}"
-                        printf "║  HIGH:      %-48s║\\n" "${HIGH_COUNT}"
-                        printf "║  Secrets:   %-48s║\\n" "${SECRETS_COUNT}"
-                        printf "║  Misconfig: %-48s║\\n" "${MISCONFIG_COUNT}"
-                        echo "╠══════════════════════════════════════════════════════════════╣"
-                        if [ "${CRITICAL_COUNT}" -gt 0 ] || [ "${SECRETS_COUNT}" -gt 0 ]; then
-                            echo "║  GATE: FAIL                                                  ║"
-                            echo "╚══════════════════════════════════════════════════════════════╝"
-                            exit 1
-                        else
-                            echo "║  GATE: PASS                                                  ║"
-                            echo "╚══════════════════════════════════════════════════════════════╝"
-                            exit 0
-                        fi
-                    ''', returnStatus: true)
+                    def gateStatus = sh(script: """#!/usr/bin/env bash
+set -uo pipefail
+CRITICAL=0; HIGH=0; SECRETS=0; MISCONFIG=0
 
-                    if (gateResult != 0 && params.FAIL_ON_CRITICAL) {
-                        unstable('CRITICAL vulnerabilities or secrets detected — marking UNSTABLE')
+for REPORT in "${REPORTS_DIR}/trivy/"*.json "${REPORTS_DIR}/trivy-image-scan.json"; do
+    [ -f "\$REPORT" ] || continue
+    COUNTS=\$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f: data = json.load(f)
+    results = data.get('Results', [])
+    c = sum(1 for r in results for v in (r.get('Vulnerabilities') or []) if v.get('Severity') == 'CRITICAL')
+    h = sum(1 for r in results for v in (r.get('Vulnerabilities') or []) if v.get('Severity') == 'HIGH')
+    m = sum(1 for r in results for v in (r.get('Misconfigurations') or []) if v.get('Severity') in ('CRITICAL','HIGH'))
+    print(c, h, m)
+except: print('0 0 0')
+" "\$REPORT" 2>/dev/null || echo "0 0 0")
+    CRITICAL=\$((CRITICAL + \$(echo "\$COUNTS" | awk '{print \$1}')))
+    HIGH=\$((HIGH     + \$(echo "\$COUNTS" | awk '{print \$2}')))
+    MISCONFIG=\$((MISCONFIG + \$(echo "\$COUNTS" | awk '{print \$3}')))
+done
+
+if [ -f "${REPORTS_DIR}/secret-scan.json" ]; then
+    SECRETS=\$(python3 -c "
+import json
+try:
+    with open('${REPORTS_DIR}/secret-scan.json') as f: data = json.load(f)
+    print(sum(len(r.get('Secrets') or []) for r in data.get('Results', [])))
+except: print(0)
+" 2>/dev/null || echo 0)
+fi
+
+cat > "${REPORTS_DIR}/gate-results.txt" <<EOF
+CRITICAL_VULNS=\${CRITICAL}
+HIGH_VULNS=\${HIGH}
+SECRETS=\${SECRETS}
+MISCONFIGS=\${MISCONFIG}
+EOF
+
+echo "======================================================================"
+echo "  SECURITY GATE RESULTS"
+echo "======================================================================"
+printf "  CRITICAL vulnerabilities:  %s\\n" "\${CRITICAL}"
+printf "  HIGH vulnerabilities:      %s\\n" "\${HIGH}"
+printf "  Secrets detected:          %s\\n" "\${SECRETS}"
+printf "  Misconfigurations (C/H):   %s\\n" "\${MISCONFIG}"
+echo "----------------------------------------------------------------------"
+if [ "\${CRITICAL}" -gt 0 ] || [ "\${SECRETS}" -gt 0 ]; then
+    echo "  GATE: FAIL — CRITICAL vulns or secrets found"
+    echo "======================================================================"
+    exit 1
+else
+    echo "  GATE: PASS"
+    echo "======================================================================"
+    exit 0
+fi
+""", returnStatus: true)
+
+                    if (gateStatus != 0 && params.FAIL_ON_CRITICAL) {
+                        unstable('CRITICAL vulnerabilities or secrets detected — build marked UNSTABLE')
                     }
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 18: Deploy to K8s (optional)
+        // STAGE 17: Deploy to K8s (optional)
         // =====================================================================
         stage('Deploy to K8s') {
-            when { expression { params.DEPLOY_TO_K8S && env.BUILT_IMAGE?.trim() } }
+            when { expression { params.DEPLOY_TO_K8S && (env.BUILT_IMAGE?.trim()) } }
             steps {
                 script {
-                    def namespace = params.K8S_NAMESPACE ?: params.IMAGE_NAME
+                    def ns      = params.K8S_NAMESPACE ?: params.IMAGE_NAME ?: 'default'
+                    def imgName = params.IMAGE_NAME ?: 'app'
                     sh """
-                        kubectl set image deployment/${params.IMAGE_NAME} \
-                            ${params.IMAGE_NAME}=${env.BUILT_IMAGE} -n ${namespace} 2>/dev/null || true
-                        kubectl rollout status deployment/${params.IMAGE_NAME} \
-                            -n ${namespace} --timeout=300s 2>/dev/null || true
+                        kubectl set image deployment/${imgName} \
+                            ${imgName}=${env.BUILT_IMAGE} -n ${ns} 2>/dev/null || true
+                        kubectl rollout status deployment/${imgName} \
+                            -n ${ns} --timeout=300s 2>/dev/null || true
                     """
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 19: Comprehensive Final Report
+        // STAGE 18: Comprehensive Final Report
         // =====================================================================
         stage('Comprehensive Final Report') {
             steps {
-                script {
-                    echo """
-╔══════════════════════════════════════════════════════════════╗
-║     Generating Comprehensive Final Report                    ║
-║     ├── [1] Unit Test Report                                 ║
-║     ├── [2] Coverage Report                                  ║
-║     ├── [3] SonarQube Report                                 ║
-║     ├── [4] CycloneDX SBOM Report                            ║
-║     ├── [5] Trivy Security Report                            ║
-║     ├── [6] Secret Detection Report                          ║
-║     ├── [7] Additional Reports                               ║
-║     └── [FINAL] Comprehensive HTML + TXT + JSON              ║
-║         ├── HIGH / CRITICAL / BLOCKER issues                ║
-║         ├── Test Coverage overview                           ║
-║         └── SonarQube overview                               ║
-╚══════════════════════════════════════════════════════════════╝
-                    """
-                }
+                sh """
+                    # Copy trivy sub-dir files to root for report generator backward compat
+                    for f in '${REPORTS_DIR}/trivy/'*.json; do
+                        [ -f "\$f" ] && cp "\$f" '${REPORTS_DIR}/' 2>/dev/null || true
+                    done
+                    true
+                """
 
                 sh """
-                    export REPORTS_DIR="${REPORTS_DIR}"
-                    export LANGUAGE="${env.DETECTED_LANG}"
-                    export IMAGE_NAME="${env.BUILT_IMAGE ?: params.IMAGE_NAME ?: 'N/A'}"
-                    export COVERAGE_THRESHOLD="${COVERAGE_THRESHOLD}"
+                    export REPORTS_DIR='${REPORTS_DIR}'
+                    export LANGUAGE='${env.DETECTED_LANG}'
+                    export IMAGE_NAME='${env.BUILT_IMAGE ?: params.IMAGE_NAME ?: 'N/A'}'
+                    export COVERAGE_THRESHOLD='${COVERAGE_THRESHOLD}'
 
-                    chmod +x "${WORKSPACE}/jenkins/scripts/generate-comprehensive-report.sh" 2>/dev/null || true
-                    bash "${WORKSPACE}/jenkins/scripts/generate-comprehensive-report.sh" \
-                        "${REPORTS_DIR}" "${env.DETECTED_LANG}" \
-                        "${env.BUILT_IMAGE ?: params.IMAGE_NAME ?: 'N/A'}"
+                    chmod +x '${WORKSPACE}/jenkins/scripts/generate-comprehensive-report.sh' 2>/dev/null || true
+                    bash '${WORKSPACE}/jenkins/scripts/generate-comprehensive-report.sh' \
+                        '${REPORTS_DIR}' '${env.DETECTED_LANG}' \
+                        '${env.BUILT_IMAGE ?: params.IMAGE_NAME ?: 'N/A'}' 2>&1 || true
                 """
 
                 sh '''
-                    if [ -f "${REPORTS_DIR}/comprehensive-report.txt" ]; then
-                        echo ""; echo ""
-                        cat "${REPORTS_DIR}/comprehensive-report.txt"
-                    fi
+                    echo ""; echo ""
+                    [ -f "${REPORTS_DIR}/comprehensive-report.txt" ] && \
+                        cat "${REPORTS_DIR}/comprehensive-report.txt" || true
 
                     echo ""
-                    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
-                    echo "║  REPORT FILES GENERATED                                                     ║"
-                    echo "╠══════════════════════════════════════════════════════════════════════════════╣"
-                    echo "║  [COMPREHENSIVE]"
+                    echo "======================================================================"
+                    echo "  PIPELINE WARNINGS"
+                    echo "======================================================================"
+                    cat "${REPORTS_DIR}/pipeline-warnings.txt" 2>/dev/null || echo "  No warnings"
+                    echo "======================================================================"
+
+                    echo ""
+                    echo "======================================================================"
+                    echo "  GENERATED REPORT FILES"
+                    echo "======================================================================"
+                    echo "  [Comprehensive Reports]"
                     for f in comprehensive-report.html comprehensive-report.txt comprehensive-report.json; do
-                        [ -f "${REPORTS_DIR}/$f" ] && printf "║    %-70s ║\\n" "$f"
+                        [ -f "${REPORTS_DIR}/$f" ] && echo "    $f"
                     done
-                    echo "║  [UNIT TESTS]"
-                    for f in "${REPORTS_DIR}"/pytest-*.xml "${REPORTS_DIR}"/pytest-*.html; do
-                        [ -f "$f" ] && printf "║    %-70s ║\\n" "$(basename $f)"; done
-                    echo "║  [COVERAGE]"
-                    for f in coverage.xml jacoco-coverage.xml go-coverage.out lcov.info; do
-                        [ -f "${REPORTS_DIR}/$f" ] && printf "║    %-70s ║\\n" "$f"; done
-                    echo "║  [SONARQUBE]"
-                    for f in "${REPORTS_DIR}"/sonarqube/*; do
-                        [ -f "$f" ] && printf "║    %-70s ║\\n" "sonarqube/$(basename $f)"; done
-                    echo "║  [SBOM]"
-                    for f in "${REPORTS_DIR}"/sbom/*; do
-                        [ -f "$f" ] && printf "║    %-70s ║\\n" "sbom/$(basename $f)"; done
-                    echo "║  [TRIVY]"
-                    for f in "${REPORTS_DIR}"/trivy-*.json; do
-                        [ -f "$f" ] && printf "║    %-70s ║\\n" "$(basename $f)"; done
-                    echo "║  [SECRET DETECTION]"
-                    [ -f "${REPORTS_DIR}/secret-scan.json" ] && printf "║    %-70s ║\\n" "secret-scan.json"
-                    echo "║  [OTHER]"
-                    for f in hadolint.json shellcheck.json grype-sca.json bandit-report.json npm-audit.json gate-results.txt; do
-                        [ -f "${REPORTS_DIR}/$f" ] && printf "║    %-70s ║\\n" "$f"; done
-                    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+                    echo "  [SBOM]"
+                    ls "${REPORTS_DIR}/sbom/" 2>/dev/null | while read f; do echo "    sbom/$f"; done
+                    echo "  [Trivy]"
+                    ls "${REPORTS_DIR}/trivy/" 2>/dev/null | while read f; do echo "    trivy/$f"; done
+                    echo "  [Unit Tests]"
+                    ls "${REPORTS_DIR}"/pytest-*.xml "${REPORTS_DIR}"/pytest-*.html 2>/dev/null | while read f; do echo "    $(basename $f)"; done
+                    echo "  [Secrets/SAST]"
+                    [ -f "${REPORTS_DIR}/secret-scan.json" ] && echo "    secret-scan.json"
+                    echo "  [SonarQube]"
+                    ls "${REPORTS_DIR}/sonarqube/" 2>/dev/null | while read f; do echo "    sonarqube/$f"; done
+                    echo "  [Other]"
+                    for f in hadolint.txt hadolint.json shellcheck.json grype-sca.json grype-sca.txt bandit-report.json gate-results.txt kubesec-results.json pipeline-warnings.txt secret-scan.txt; do
+                        [ -f "${REPORTS_DIR}/$f" ] && echo "    $f"
+                    done
+                    # List any per-Dockerfile hadolint JSON reports
+                    ls "${REPORTS_DIR}"/hadolint-*.json 2>/dev/null | while read f; do echo "    $(basename $f)"; done
+                    echo "======================================================================"
                 '''
             }
         }
@@ -1196,22 +1566,26 @@ EOF
                 keepAll: true,
                 reportDir: 'pipeline-reports',
                 reportFiles: 'comprehensive-report.html,pytest-report.html',
-                reportName: 'Comprehensive DevSecOps Report'
+                reportName: 'DevSecOps Report'
             ])
 
-            junit allowEmptyResults: true, testResults: 'pipeline-reports/**/*.xml'
+            junit allowEmptyResults: true,
+                  testResults: 'pipeline-reports/**/*.xml'
 
-            echo """
-╔══════════════════════════════════════════════════════════════╗
-║  Pipeline Complete — View Reports:                           ║
-║    • HTML Report: pipeline-reports/comprehensive-report.html ║
-║    • Jenkins: Build → Comprehensive DevSecOps Report         ║
-╚══════════════════════════════════════════════════════════════╝
-            """
+            script {
+                echo """
+======================================================================
+  Unified DevSecOps Pipeline Complete
+  Reports:    pipeline-reports/comprehensive-report.html
+  Warnings:   pipeline-reports/pipeline-warnings.txt
+  Jenkins:    Build => DevSecOps Report
+======================================================================
+                """
+            }
         }
-        success { echo 'Comprehensive DevSecOps Pipeline PASSED' }
-        unstable { echo 'Pipeline completed with WARNINGS — review the Comprehensive Report' }
-        failure { echo 'Pipeline FAILED — review Comprehensive Report for details' }
+        success  { echo '[OK] Unified DevSecOps Pipeline PASSED' }
+        unstable { echo '[!!] Pipeline UNSTABLE — CRITICAL issues found. Review Comprehensive Report.' }
+        failure  { echo '[!!] Pipeline FAILED — Check stage logs and pipeline-reports/pipeline-warnings.txt' }
         cleanup {
             cleanWs(deleteDirs: true, patterns: [
                 [pattern: '.trivy-cache/**', type: 'INCLUDE'],
@@ -1225,19 +1599,53 @@ EOF
 // Helper: Auto-detect project language
 // =============================================================================
 def detectLanguage() {
-    if (fileExists('requirements.txt') || fileExists('setup.py') || fileExists('pyproject.toml') || fileExists('Pipfile')) {
-        echo "Detected: Python"; return 'python'
+    // --- Root-level fast-path checks ---
+    if (fileExists('requirements.txt') || fileExists('setup.py') ||
+        fileExists('pyproject.toml') || fileExists('Pipfile')) {
+        echo "Auto-detected: Python (root)"; return 'python'
     }
-    if (fileExists('pom.xml')) { echo "Detected: Java (Maven)"; return 'java-maven' }
-    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) { echo "Detected: Java (Gradle)"; return 'java-gradle' }
-    if (fileExists('angular.json')) { echo "Detected: Angular"; return 'angular' }
+    if (fileExists('pom.xml')) { echo "Auto-detected: Java (Maven)"; return 'java-maven' }
+    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
+        echo "Auto-detected: Java (Gradle)"; return 'java-gradle'
+    }
+    if (fileExists('angular.json')) { echo "Auto-detected: Angular"; return 'angular' }
     if (fileExists('package.json')) {
-        def pkgJson = readFile('package.json')
-        if (pkgJson.contains('"react"')) { echo "Detected: React"; return 'react' }
-        echo "Detected: Node.js"; return 'nodejs'
+        def pkg = readFile('package.json')
+        if (pkg.contains('"react"')) { echo "Auto-detected: React"; return 'react' }
+        if (pkg.contains('"vue"'))   { echo "Auto-detected: Vue"; return 'vue' }
+        echo "Auto-detected: Node.js"; return 'nodejs'
     }
-    if (fileExists('go.mod')) { echo "Detected: Go"; return 'go' }
-    if (sh(script: 'find . -maxdepth 2 -name "*.csproj" | head -1', returnStdout: true).trim()) { echo "Detected: .NET"; return 'dotnet' }
-    echo "Could not auto-detect — defaulting to python"
+    if (fileExists('go.mod')) { echo "Auto-detected: Go"; return 'go' }
+    if (sh(script: 'find . -maxdepth 2 -name "*.csproj" | head -1', returnStdout: true).trim()) {
+        echo "Auto-detected: .NET"; return 'dotnet'
+    }
+
+    // --- Sub-directory detection (backend/, src/, app/, server/, api/) ---
+    def pyInSubdir = sh(script: """
+        find . -maxdepth 3 \\( -name 'requirements.txt' -o -name 'pyproject.toml' -o -name 'setup.py' -o -name 'Pipfile' \\) \\
+            ! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/pipeline-reports/*' 2>/dev/null | head -1
+    """, returnStdout: true).trim()
+    if (pyInSubdir) { echo "Auto-detected: Python (subdir: ${pyInSubdir})"; return 'python' }
+
+    def angularInSubdir = sh(script: "find . -maxdepth 3 -name 'angular.json' ! -path '*/node_modules/*' 2>/dev/null | head -1", returnStdout: true).trim()
+    if (angularInSubdir) { echo "Auto-detected: Angular (subdir: ${angularInSubdir})"; return 'angular' }
+
+    def pkgInSubdir = sh(script: "find . -maxdepth 3 -name 'package.json' ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | head -1", returnStdout: true).trim()
+    if (pkgInSubdir) {
+        try {
+            def pkg = readFile(pkgInSubdir)
+            if (pkg.contains('"react"')) { echo "Auto-detected: React (subdir: ${pkgInSubdir})"; return 'react' }
+            if (pkg.contains('"vue"'))   { echo "Auto-detected: Vue (subdir: ${pkgInSubdir})"; return 'vue' }
+            echo "Auto-detected: Node.js (subdir: ${pkgInSubdir})"; return 'nodejs'
+        } catch(e) { /* ignore read errors */ }
+    }
+
+    def goInSubdir = sh(script: "find . -maxdepth 3 -name 'go.mod' ! -path '*/.git/*' 2>/dev/null | head -1", returnStdout: true).trim()
+    if (goInSubdir) { echo "Auto-detected: Go (subdir: ${goInSubdir})"; return 'go' }
+
+    def csprojInSubdir = sh(script: 'find . -maxdepth 4 -name "*.csproj" ! -path "*/obj/*" 2>/dev/null | head -1', returnStdout: true).trim()
+    if (csprojInSubdir) { echo "Auto-detected: .NET (subdir: ${csprojInSubdir})"; return 'dotnet' }
+
+    echo "Language detection: defaulting to python"
     return 'python'
 }

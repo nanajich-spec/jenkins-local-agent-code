@@ -468,6 +468,11 @@ def parse_sbom():
         summary_counts["sbom_components"] = total
         section["status"] = "GENERATED" if total > 0 else "SKIPPED"
 
+        # List text-format SBOM reports for reference
+        text_reports = sorted(glob.glob(os.path.join(sbom_dir, "*.txt")))
+        if text_reports:
+            section["text_reports"] = [os.path.basename(t) for t in text_reports]
+
     sections["sbom"] = section
 
 # =============================================================================
@@ -476,24 +481,36 @@ def parse_sbom():
 def parse_other_reports():
     section = {"title": "Additional Security Reports", "status": "SKIPPED", "details": []}
 
-    # Hadolint
-    hadolint_file = os.path.join(REPORTS_DIR, "hadolint.json")
-    if os.path.exists(hadolint_file):
+    # Hadolint — support both legacy hadolint.json and new per-Dockerfile hadolint-*.json
+    hadolint_jsons = [os.path.join(REPORTS_DIR, "hadolint.json")] + \
+                     sorted(glob.glob(os.path.join(REPORTS_DIR, "hadolint-*.json")))
+    total_hadolint = 0
+    for hadolint_file in hadolint_jsons:
+        if not os.path.exists(hadolint_file): continue
         try:
             with open(hadolint_file) as f:
-                issues = json.load(f)
-            section["details"].append({"tool": "Hadolint (Dockerfile Lint)", "issues": len(issues)})
+                content = f.read().strip()
+            if not content or content in ('[]', '[[]]', ''):
+                continue
+            issues = json.loads(content)
+            # Handle [[...]] wrapping or flat list
+            if isinstance(issues, list) and len(issues) > 0 and isinstance(issues[0], list):
+                issues = [i for sub in issues for i in sub]
+            total_hadolint += len(issues)
             for i in issues:
                 if i.get("level") in ("error", "warning"):
                     all_critical_issues.append({
-                        "source": "Hadolint",
+                        "source": f"Hadolint ({os.path.basename(hadolint_file)})",
                         "severity": "HIGH" if i.get("level") == "error" else "MEDIUM",
-                        "title": f"{i.get('code','')}: {i.get('message','')}",
-                        "detail": f"Line {i.get('line','?')}"
+                        "title": i.get("code", "?"),
+                        "description": i.get("message", ""),
+                        "location": f"{i.get('file','?')}:{i.get('line','?')}"
                     })
-            section["status"] = "SCANNED"
-        except:
+        except Exception as ex:
             pass
+    if total_hadolint > 0:
+        section["details"].append({"tool": "Hadolint (Dockerfile Lint)", "issues": total_hadolint})
+        section["status"] = "SCANNED"
 
     # ShellCheck
     shellcheck_file = os.path.join(REPORTS_DIR, "shellcheck.json")
@@ -694,6 +711,9 @@ def generate_text_report():
         if isinstance(d, dict) and "file" in d:
             lines.append(f"│    {d['file']:40s}  {d.get('components',0)} components".ljust(w-1) + "│")
     lines.append(f"│  Total Components: {summary_counts['sbom_components']}".ljust(w-1) + "│")
+    # List human-readable text SBOM reports
+    for txt in s.get("text_reports", []):
+        lines.append(f"│  [TEXT] pipeline-reports/sbom/{txt}".ljust(w-1) + "│")
     lines.append("└" + "─" * (w-2) + "┘")
 
     # ── Section 7: Other Reports ──
