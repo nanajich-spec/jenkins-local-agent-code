@@ -238,7 +238,7 @@ echo "===================================================================="
         // =====================================================================
         // STAGE 1: Checkout & Language Detection
         // =====================================================================
-        stage('Checkout & Detect Language') {
+        stage('Checkout & Discover Modules') {
             steps {
                 script {
                     if (params.GIT_REPO?.trim()) {
@@ -257,409 +257,671 @@ echo "===================================================================="
                         mkdir -p '${REPORTS_DIR}/trivy'
                     """
 
-                    env.DETECTED_LANG = params.LANGUAGE
-                    if (params.LANGUAGE == 'auto') {
-                        env.DETECTED_LANG = detectLanguage()
-                    }
+                    // =========================================================
+                    // Dynamic Module Discovery — Python scans EVERY subdirectory
+                    // Produces: pipeline-reports/modules.json
+                    // Schema per module:
+                    //   key, dir, language, makefiles[], dockerfiles[],
+                    //   test_dirs[], dep_files[]
+                    // =========================================================
+                    sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'DISCOVERY_EOF'
+import os, json, glob, re, sys
 
-                    // --- Recursive Dockerfile detection (root + all subdirs up to depth 4) ---
-                    def dfParam = params.DOCKERFILE_PATH ?: 'Dockerfile'
-                    def allDockerfilesList = sh(script: """
-                        {
-                            [ -f '${dfParam}' ] && echo '${dfParam}'
-                            find . -maxdepth 4 \\( -name 'Dockerfile' -o -name 'Containerfile' -o -name 'Dockerfile.*' \\) \\
-                                ! -path '*/node_modules/*' ! -path '*/.git/*' \\
-                                ! -path '*/pipeline-reports/*' ! -path '*/.trivy-cache/*' 2>/dev/null | sed 's|^./||'
-                        } | sort -u | grep -v '^\$' | tr '\\n' ' '
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+
+# Never descend into these directories
+SKIP_DIRS = {
+    'node_modules', '.git', 'pipeline-reports', '.trivy-cache',
+    '.venv', 'venv', 'env', '.env', '__pycache__', '.scannerwork',
+    '.mypy_cache', '.pytest_cache', 'dist', 'build', 'target',
+    '.gradle', '.mvn', 'obj', 'bin', '.idea', '.vscode',
+    'htmlcov', 'coverage', '.nyc_output', '.tox', 'eggs',
+    '.eggs', 'bower_components', 'vendor'
+}
+
+# Ordered list: most-specific lang-marker first
+LANG_MARKERS = [
+    ('pom.xml',           'java-maven'),
+    ('build.gradle',      'java-gradle'),
+    ('build.gradle.kts',  'java-gradle'),
+    ('angular.json',      'angular'),
+    ('go.mod',            'go'),
+    ('requirements.txt',  'python'),
+    ('setup.py',          'python'),
+    ('pyproject.toml',    'python'),
+    ('Pipfile',           'python'),
+    ('package.json',      'nodejs'),   # react/vue refined below
+]
+
+def detect_lang(d):
+    for marker, lang in LANG_MARKERS:
+        if os.path.isfile(os.path.join(d, marker)):
+            if lang == 'nodejs':
+                try:
+                    pkg = open(os.path.join(d, 'package.json')).read()
+                    if '"react"' in pkg or '"react-dom"' in pkg: return 'react'
+                    if '"vue"' in pkg: return 'vue'
+                except: pass
+            return lang
+    # dotnet: any .csproj in the dir
+    if glob.glob(os.path.join(d, '*.csproj')):
+        return 'dotnet'
+    return None
+
+def find_test_dirs(module_dir, lang):
+    """Walk module_dir and collect all directories that contain test code."""
+    found = set()
+    test_dir_names = {'tests', 'test', '__tests__', 'spec', 'specs', 'e2e'}
+    for root, dirs, files in os.walk(module_dir):
+        # Prune unwanted dirs in-place
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        base = os.path.basename(root)
+        rel  = os.path.relpath(root, WORKSPACE)
+
+        if lang == 'python':
+            py_test_files = [f for f in files
+                             if f.startswith('test_') or f.endswith('_test.py')
+                             or f == 'conftest.py']
+            if py_test_files:
+                # prefer the named test dir; otherwise include parent
+                if base in test_dir_names:
+                    found.add(rel)
+                else:
+                    # flat test files (e.g. root has test_main.py)
+                    if any(f.startswith('test_') for f in py_test_files):
+                        found.add(rel)
+
+        elif lang in ('nodejs', 'react', 'angular', 'vue'):
+            if base in test_dir_names:
+                found.add(rel)
+            if any(f.endswith(('.test.js','.test.ts','.spec.js','.spec.ts',
+                               '.test.jsx','.test.tsx','.spec.jsx','.spec.tsx'))
+                   for f in files):
+                found.add(rel)
+
+        elif lang in ('java-maven', 'java-gradle'):
+            parts = rel.replace('\\\\', '/').split('/')
+            if 'src' in parts and 'test' in parts and files:
+                found.add(rel)
+
+        elif lang == 'go':
+            if any(f.endswith('_test.go') for f in files):
+                found.add(rel)
+
+        elif lang == 'dotnet':
+            if base in test_dir_names or any(
+                    'Test' in f and f.endswith('.csproj') for f in files):
+                found.add(rel)
+
+    return sorted(found)
+
+def get_makefiles(module_dir):
+    """Find all Makefiles in module_dir tree and inspect their targets."""
+    result = []
+    for root, dirs, files in os.walk(module_dir):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        if 'Makefile' not in files:
+            continue
+        mf_abs  = os.path.join(root, 'Makefile')
+        mf_path = os.path.relpath(mf_abs, WORKSPACE)
+        mf_dir  = os.path.relpath(root, WORKSPACE)
+        if mf_dir == '.': mf_dir = ''
+        targets = []
+        try:
+            content = open(mf_abs).read()
+            for tgt in ['docker-build','build-image','scan','image','docker',
+                        'container','push','build','all','test','lint']:
+                if re.search(r'^' + re.escape(tgt) + r'\\s*:', content, re.MULTILINE):
+                    targets.append(tgt)
+        except: pass
+        build_target  = next((t for t in targets
+                              if t in ('build','all')), '')
+        docker_target = next((t for t in targets
+                              if t in ('docker-build','build-image','image',
+                                       'docker','container')), '')
+        scan_target   = next((t for t in targets if t == 'scan'), '')
+        result.append({
+            'path': mf_path, 'dir': mf_dir, 'targets': targets,
+            'build_target': build_target, 'docker_target': docker_target,
+            'scan_target': scan_target
+        })
+    return result
+
+def get_dockerfiles(module_dir):
+    """Find all Dockerfiles in module_dir tree."""
+    found = []
+    for root, dirs, files in os.walk(module_dir):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        for f in files:
+            if f == 'Dockerfile' or f == 'Containerfile' or f.startswith('Dockerfile.'):
+                found.append(os.path.relpath(os.path.join(root, f), WORKSPACE))
+    return sorted(found)
+
+def get_dep_files(module_dir, lang):
+    dep_files = []
+    if lang == 'python':
+        for name in ['requirements.txt','requirements-dev.txt',
+                     'requirements-test.txt','setup.py','pyproject.toml','Pipfile']:
+            fp = os.path.join(module_dir, name)
+            if os.path.isfile(fp):
+                dep_files.append(os.path.relpath(fp, WORKSPACE))
+        # also look one level deeper (e.g. backend/requirements.txt)
+        for sub in os.listdir(module_dir):
+            sd = os.path.join(module_dir, sub)
+            if not os.path.isdir(sd) or sub in SKIP_DIRS or sub.startswith('.'): continue
+            for name in ['requirements.txt','requirements-dev.txt']:
+                fp = os.path.join(sd, name)
+                if os.path.isfile(fp):
+                    dep_files.append(os.path.relpath(fp, WORKSPACE))
+    elif lang in ('nodejs','react','angular','vue'):
+        fp = os.path.join(module_dir, 'package.json')
+        if os.path.isfile(fp):
+            dep_files.append(os.path.relpath(fp, WORKSPACE))
+    elif lang == 'java-maven':
+        fp = os.path.join(module_dir, 'pom.xml')
+        if os.path.isfile(fp): dep_files.append(os.path.relpath(fp, WORKSPACE))
+    elif lang == 'java-gradle':
+        for n in ('build.gradle','build.gradle.kts'):
+            fp = os.path.join(module_dir, n)
+            if os.path.isfile(fp): dep_files.append(os.path.relpath(fp, WORKSPACE))
+    elif lang == 'go':
+        fp = os.path.join(module_dir, 'go.mod')
+        if os.path.isfile(fp): dep_files.append(os.path.relpath(fp, WORKSPACE))
+    elif lang == 'dotnet':
+        dep_files += [os.path.relpath(c, WORKSPACE)
+                      for c in glob.glob(os.path.join(module_dir, '*.csproj'))]
+    return dep_files
+
+# ── Module scanning ────────────────────────────────────────────────────────
+modules = {}
+
+def scan_module(d, key):
+    lang = detect_lang(d)
+    if not lang:
+        return
+    rel = os.path.relpath(d, WORKSPACE)
+    if rel == '.': rel = ''
+    modules[key] = {
+        'key':        key,
+        'dir':        rel,
+        'language':   lang,
+        'makefiles':  get_makefiles(d),
+        'dockerfiles':get_dockerfiles(d),
+        'test_dirs':  find_test_dirs(d, lang),
+        'dep_files':  get_dep_files(d, lang),
+    }
+
+# Always scan workspace root
+scan_module(WORKSPACE, 'root')
+
+# Scan every immediate subdirectory — catches frontend/, backend/, api/, etc.
+for entry in sorted(os.listdir(WORKSPACE)):
+    full = os.path.join(WORKSPACE, entry)
+    if os.path.isdir(full) and entry not in SKIP_DIRS and not entry.startswith('.'):
+        scan_module(full, entry)
+
+# Deduplication: if a child module has EXACTLY the same dockerfiles/makefiles as root,
+# remove duplicates from root to avoid double-builds (keep child's entry only).
+root_dfs  = set(modules.get('root', {}).get('dockerfiles', []))
+root_mfs  = set(x['path'] for x in modules.get('root', {}).get('makefiles', []))
+for key, m in list(modules.items()):
+    if key == 'root': continue
+    child_dfs = set(m.get('dockerfiles', []))
+    child_mfs = set(x['path'] for x in m.get('makefiles', []))
+    # Remove from root anything that also appears in a proper child module
+    if 'root' in modules:
+        modules['root']['dockerfiles'] = [d for d in modules['root']['dockerfiles']
+                                           if d not in child_dfs]
+        modules['root']['makefiles']   = [mf for mf in modules['root']['makefiles']
+                                           if mf['path'] not in child_mfs]
+
+# Write modules.json
+os.makedirs(REPORTS_DIR, exist_ok=True)
+mf = os.path.join(REPORTS_DIR, 'modules.json')
+with open(mf, 'w') as f:
+    json.dump(modules, f, indent=2)
+
+# Console summary
+print('=' * 70)
+print(f'  WORKSPACE MODULE DISCOVERY — {len(modules)} module(s)')
+print('=' * 70)
+all_test_dirs = []
+all_dockerfiles = []
+all_makefiles   = []
+for k,m in modules.items():
+    print(f'  [{k}]  dir={m["dir"] or "."}  lang={m["language"]}')
+    if m['test_dirs']:
+        print(f'    tests:       {m["test_dirs"]}')
+        all_test_dirs.extend(m['test_dirs'])
+    if m['makefiles']:
+        for mf2 in m['makefiles']:
+            print(f'    makefile:    {mf2["path"]}  targets={mf2["targets"]}')
+            all_makefiles.append(mf2['path'])
+    if m['dockerfiles']:
+        print(f'    dockerfiles: {m["dockerfiles"]}')
+        all_dockerfiles.extend(m['dockerfiles'])
+    if m['dep_files']:
+        print(f'    dep files:   {m["dep_files"]}')
+print('=' * 70)
+if not all_test_dirs:
+    print('  [WARNING] No test directories found in any module')
+if not all_dockerfiles:
+    print('  [WARNING] No Dockerfiles found in any module')
+
+DISCOVERY_EOF
+"""
+
+                    // =========================================================
+                    // Read modules.json back into Groovy env vars
+                    // =========================================================
+                    env.MODULES_JSON = readFile("${REPORTS_DIR}/modules.json").trim()
+
+                    // Primary language = first non-root module's language, or root
+                    env.DETECTED_LANG = sh(script: """
+python3 -c "
+import json, sys
+modules = json.loads(open('${REPORTS_DIR}/modules.json').read())
+# Prefer explicit param
+param = '${params.LANGUAGE}'
+if param != 'auto':
+    print(param)
+    sys.exit(0)
+# First child module wins; fall back to root
+for k,m in modules.items():
+    if k != 'root':
+        print(m['language']); sys.exit(0)
+if 'root' in modules:
+    print(modules['root']['language']); sys.exit(0)
+print('python')
+"
                     """, returnStdout: true).trim()
-                    env.HAS_DOCKERFILE  = allDockerfilesList ? 'true' : 'false'
-                    env.ALL_DOCKERFILES = allDockerfilesList ?: ''
 
-                    // --- Recursive Makefile detection (root first, then subdirs up to depth 3) ---
-                    def makefilePath = sh(script: """
-                        if [ -f "Makefile" ]; then echo "Makefile"
-                        else find . -maxdepth 3 -name 'Makefile' \\
-                            ! -path '*/node_modules/*' ! -path '*/.git/*' \\
-                            ! -path '*/pipeline-reports/*' 2>/dev/null | head -1 | sed 's|^./||'
-                        fi
+                    // Flat list of ALL dockerfiles across ALL modules
+                    env.ALL_DOCKERFILES = sh(script: """
+python3 -c "
+import json
+modules = json.loads(open('${REPORTS_DIR}/modules.json').read())
+dfs = []
+for m in modules.values():
+    dfs.extend(m.get('dockerfiles', []))
+print(' '.join(sorted(set(dfs))))
+"
                     """, returnStdout: true).trim()
-                    env.HAS_MAKEFILE  = makefilePath ? 'true' : 'false'
-                    env.MAKEFILE_PATH = makefilePath ?: 'Makefile'
-                    env.MAKEFILE_DIR  = (makefilePath && makefilePath != 'Makefile') ? sh(script: "MF='${makefilePath}'; D=\$(dirname \"\$MF\"); [ \"\$D\" = '.' ] && echo '' || echo \"\$D\"", returnStdout: true).trim() : ''
+                    env.HAS_DOCKERFILE = env.ALL_DOCKERFILES ? 'true' : 'false'
 
-                    def makeBuildTarget = ''
-                    if (env.HAS_MAKEFILE == 'true') {
-                        def mfForGrep = makefilePath ?: 'Makefile'
-                        makeBuildTarget = sh(script: """
-                            MF='${mfForGrep}'
-                            if grep -qE '^docker-build:' "\$MF" 2>/dev/null; then echo 'docker-build'
-                            elif grep -qE '^build-image:' "\$MF" 2>/dev/null; then echo 'build-image'
-                            elif grep -qE '^image:' "\$MF" 2>/dev/null; then echo 'image'
-                            elif grep -qE '^docker:' "\$MF" 2>/dev/null; then echo 'docker'
-                            elif grep -qE '^container:' "\$MF" 2>/dev/null; then echo 'container'
-                            elif grep -qE '^build:' "\$MF" 2>/dev/null; then echo 'build'
-                            else echo ''; fi
-                        """, returnStdout: true).trim()
-                    }
-                    env.MAKE_BUILD_TARGET = makeBuildTarget ?: ''
+                    // Flat list of ALL makefile paths across ALL modules
+                    env.ALL_MAKEFILES = sh(script: """
+python3 -c "
+import json
+modules = json.loads(open('${REPORTS_DIR}/modules.json').read())
+mfs = []
+for m in modules.values():
+    mfs.extend(x['path'] for x in m.get('makefiles', []))
+print(' '.join(sorted(set(mfs))))
+"
+                    """, returnStdout: true).trim()
+                    env.HAS_MAKEFILE = env.ALL_MAKEFILES ? 'true' : 'false'
 
+                    // Any test dirs?
+                    env.HAS_TESTS = sh(script: """
+python3 -c "
+import json
+modules = json.loads(open('${REPORTS_DIR}/modules.json').read())
+tds = [d for m in modules.values() for d in m.get('test_dirs', [])]
+print('true' if tds else 'false')
+"
+                    """, returnStdout: true).trim()
+
+                    // K8s manifests (still parameter-driven for deploy stage)
                     def k8sDir = params.K8S_MANIFESTS_DIR ?: 'cat-deployments'
                     env.K8S_MANIFESTS_DIR = k8sDir
-                    def k8sFound = sh(script: """
-                        find '${k8sDir}' \\( -name '*.yml' -o -name '*.yaml' \\) 2>/dev/null | head -1
+                    env.HAS_K8S_MANIFESTS = sh(script: """
+                        find '${k8sDir}' \\( -name '*.yml' -o -name '*.yaml' \\) 2>/dev/null | head -1 | grep -q . && echo true || echo false
                     """, returnStdout: true).trim()
-                    env.HAS_K8S_MANIFESTS = k8sFound ? 'true' : 'false'
-
-                    def testCheckScript = ''
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            // Deep search: covers root tests/, root test/, backend/tests/, src/tests/, etc.
-                            testCheckScript = "( [ -d tests ] || [ -d test ] || find . -maxdepth 6 \\( -name 'test_*.py' -o -name '*_test.py' -o -name 'test*.py' \\) ! -path '*/.venv/*' ! -path '*/venv/*' ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
-                            break
-                        case 'java-maven': case 'java-gradle':
-                            testCheckScript = "( [ -d src/test ] || find . -maxdepth 5 -name '*Test.java' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
-                            break
-                        case 'nodejs': case 'react': case 'angular': case 'vue':
-                            testCheckScript = "( [ -d test ] || [ -d tests ] || [ -d __tests__ ] || [ -d spec ] || find . -maxdepth 4 \\( -name '*.test.js' -o -name '*.test.ts' -o -name '*.spec.js' -o -name '*.spec.ts' \\) ! -path '*/node_modules/*' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
-                            break
-                        case 'go':
-                            testCheckScript = "find . -maxdepth 5 -name '*_test.go' 2>/dev/null | grep -q . && echo 'true' || echo 'false'"
-                            break
-                        case 'dotnet':
-                            testCheckScript = "( [ -d test ] || [ -d tests ] || find . -maxdepth 4 -name '*Test*.csproj' 2>/dev/null | grep -q . ) && echo 'true' || echo 'false'"
-                            break
-                        default:
-                            testCheckScript = "( [ -d test ] || [ -d tests ] ) && echo 'true' || echo 'false'"
-                    }
-                    env.HAS_TESTS = sh(script: testCheckScript, returnStdout: true).trim()
-
-                    // --- Find actual Python test directory (handles backend/tests, src/tests, etc.) ---
-                    env.PY_TEST_DIR = sh(script: """
-                        if   [ -d "tests" ]; then echo "tests"
-                        elif [ -d "test"  ]; then echo "test"
-                        else
-                            find . -maxdepth 6 -type d \\( -name "tests" -o -name "test" \\) \\
-                                ! -path '*/node_modules/*' ! -path '*/.venv/*' ! -path '*/venv/*' \\
-                                ! -path '*/pipeline-reports/*' 2>/dev/null | head -1 | sed 's|^./||'
-                        fi
-                    """, returnStdout: true).trim() ?: '.'
-
-                    // --- Detect frontend sub-project directory (React/Angular/Vue in subdir) ---
-                    env.FRONTEND_DIR = sh(script: """
-                        find . -maxdepth 3 \\( -name 'angular.json' -o -name 'package.json' \\) \\
-                            ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | \\
-                        while IFS= read -r f; do
-                            d=\$(dirname "\$f" | sed 's|^\\./||')
-                            [ "\$d" != "." ] && echo "\$d" && break
-                        done | head -1
-                    """, returnStdout: true).trim() ?: ''
 
                     env.PIPELINE_START = sh(script: 'date +%s', returnStdout: true).trim()
 
                     sh """
                         {
                           echo "=== Pipeline Warnings ==="
-                          [ '${env.HAS_DOCKERFILE}' = 'false' ] && echo "[WARNING] No Dockerfile or Containerfile found — Docker image build will be SKIPPED"
-                          [ '${env.HAS_K8S_MANIFESTS}' = 'false' ] && echo "[WARNING] No Kubernetes manifests found in '${k8sDir}/' — K8s scan will be SKIPPED"
-                          [ '${env.HAS_TESTS}' = 'false' ] && echo "[WARNING] No test files/folder found for ${env.DETECTED_LANG} — Unit tests will be SKIPPED"
-                          [ '${env.HAS_MAKEFILE}' = 'false' ] && echo "[INFO] No Makefile found — using standard build commands"
-                          [ '${env.HAS_MAKEFILE}' = 'true' ] && [ -n '${env.MAKE_BUILD_TARGET}' ] && echo "[INFO] Makefile found with target: ${env.MAKE_BUILD_TARGET}"
+                          [ '${env.HAS_DOCKERFILE}' = 'false' ] && echo "[WARNING] No Dockerfiles found in workspace — Docker build will be SKIPPED"
+                          [ '${env.HAS_K8S_MANIFESTS}' = 'false' ] && echo "[WARNING] No K8s manifests in '${k8sDir}/' — K8s scan will be SKIPPED"
+                          [ '${env.HAS_TESTS}' = 'false' ] && echo "[WARNING] No test directories found in any module — tests will be SKIPPED"
+                          [ '${env.HAS_MAKEFILE}' = 'false' ] && echo "[INFO] No Makefiles found — using standard language build commands"
                           echo "========================="
                         } | tee '${REPORTS_DIR}/pipeline-warnings.txt'
                     """
 
-                    echo """
-=====================================================================
-  Unified DevSecOps Pipeline — Configuration
-=====================================================================
-  Language:          ${env.DETECTED_LANG}
-  Branch:            ${params.GIT_BRANCH ?: 'workspace'}
-  Docker Image:      ${params.IMAGE_NAME ?: '(none — skipped)'}
-  Dockerfile(s):     ${env.HAS_DOCKERFILE}  ${env.HAS_DOCKERFILE == 'false' ? '[WARNING: not found]' : '→ ' + env.ALL_DOCKERFILES}
-  Makefile:          ${env.HAS_MAKEFILE}  ${env.MAKEFILE_PATH ? '→ ' + env.MAKEFILE_PATH + (env.MAKE_BUILD_TARGET ? " (target: ${env.MAKE_BUILD_TARGET})" : '') : ''}
-  K8s Manifests:     ${env.HAS_K8S_MANIFESTS}  ${env.HAS_K8S_MANIFESTS == 'false' ? '[WARNING: not found in ' + k8sDir + '/]' : 'in ' + k8sDir + '/'}
-  Tests Found:       ${env.HAS_TESTS}  ${env.HAS_TESTS == 'false' ? '[WARNING: no tests detected]' : '→ test dir: ' + env.PY_TEST_DIR}
-  Frontend Dir:      ${env.FRONTEND_DIR ?: '(none)'}
-  SBOM:              ${params.GENERATE_SBOM}
-  SonarQube:         ${params.RUN_SONARQUBE}
-  Trivy Scan:        ${params.RUN_TRIVY_SCAN}
-  Fail on Critical:  ${params.FAIL_ON_CRITICAL}
-=====================================================================
-                    """
+                    // Pretty-print discovery summary
+                    sh """
+python3 <<'SUMMARY_EOF'
+import json
+m = json.loads(open('${REPORTS_DIR}/modules.json').read())
+sep = '=' * 70
+print(sep)
+print('  Unified DevSecOps Pipeline — Discovered Modules')
+print(sep)
+for k, mod in m.items():
+    tds = ', '.join(mod['test_dirs']) or '(none)'
+    dfs = ', '.join(mod['dockerfiles']) or '(none)'
+    mks = ', '.join(x['path'] for x in mod['makefiles']) or '(none)'
+    print(f'  Module : {k}')
+    print(f'    Dir        : {mod["dir"] or "."}')
+    print(f'    Language   : {mod["language"]}')
+    print(f'    Tests      : {tds}')
+    print(f'    Makefiles  : {mks}')
+    print(f'    Dockerfiles: {dfs}')
+    print()
+print(sep)
+SUMMARY_EOF
+"""
                 }
             }
         }
 
         // =====================================================================
-        // STAGE 2: Install Project Dependencies
+        // STAGE 2: Install Project Dependencies (per discovered module)
         // =====================================================================
         stage('Install Project Dependencies') {
             steps {
-                script {
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            sh '''
-                                echo "=== Installing Python Project Dependencies ==="
-                                PIP="pip install --break-system-packages"
-                                [ -f "requirements.txt" ] && $PIP -r requirements.txt 2>/dev/null || pip install -r requirements.txt 2>/dev/null || true
-                                [ -f "requirements-dev.txt" ] && $PIP -r requirements-dev.txt 2>/dev/null || true
-                                if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
-                                    $PIP -e ".[dev,test]" 2>/dev/null || $PIP -e . 2>/dev/null || true
-                                fi
-                                [ -f "Pipfile" ] && ($PIP pipenv 2>/dev/null || true) && pipenv install --dev 2>/dev/null || true
-                                # Also scan subdirectory requirements files (backend/, src/, app/, etc.)
-                                find . -maxdepth 3 -name 'requirements*.txt' \
-                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
-                                while IFS= read -r req; do
-                                    [ "$(dirname "$req")" = "." ] && continue
-                                    echo "  [subdep] Installing: $req"
-                                    $PIP -r "$req" 2>/dev/null || pip install -r "$req" 2>/dev/null || true
-                                done
-                                # Install editable sub-packages (setup.py / pyproject.toml in subdirs)
-                                find . -maxdepth 3 \( -name 'setup.py' -o -name 'pyproject.toml' \) \
-                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
-                                while IFS= read -r sf; do
-                                    d=$(dirname "$sf"); [ "$d" = "." ] && continue
-                                    echo "  [subdep] Installing package from: $d"
-                                    (cd "$d" && $PIP -e ".[dev,test]" 2>/dev/null || $PIP -e . 2>/dev/null || true)
-                                done
-                                echo "[OK] Python dependencies ready"
-                            '''
-                            break
-                        case 'java-maven':
-                            sh '[ -f "pom.xml" ] && mvn dependency:resolve -q 2>/dev/null || true && echo "[OK] Maven deps ready"'
-                            break
-                        case 'java-gradle':
-                            sh '''
-                                chmod +x gradlew 2>/dev/null || true
-                                ([ -f "build.gradle" ] || [ -f "build.gradle.kts" ]) && \
-                                    (./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null) || true
-                                echo "[OK] Gradle deps ready"
-                            '''
-                            break
-                        case ['nodejs', 'react', 'angular', 'vue']:
-                            sh '''
-                                if [ -f "yarn.lock" ]; then
-                                    yarn install --frozen-lockfile 2>/dev/null || yarn install || true
-                                elif [ -f "pnpm-lock.yaml" ]; then
-                                    pnpm install --frozen-lockfile 2>/dev/null || pnpm install || true
-                                elif [ -f "package.json" ]; then
-                                    npm ci 2>/dev/null || npm install || true
-                                fi
-                                # Also install in frontend/ backend/ and any sub-package directories
-                                find . -maxdepth 3 -name 'package.json' \
-                                    ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' | \
-                                while IFS= read -r pkg; do
-                                    d=$(dirname "$pkg"); [ "$d" = "." ] && continue
-                                    echo "  [subdep] npm install in: $d"
-                                    (cd "$d" && npm ci 2>/dev/null || npm install 2>/dev/null || true)
-                                done
-                                echo "[OK] Node.js deps ready"
-                            '''
-                            break
-                        case 'go':
-                            sh '[ -f "go.mod" ] && go mod download && go mod verify 2>/dev/null || true && echo "[OK] Go deps ready"'
-                            break
-                        case 'dotnet':
-                            sh '''
-                                PROJ=$(find . -name "*.csproj" -o -name "*.sln" | head -1)
-                                [ -n "${PROJ}" ] && dotnet restore "${PROJ}" 2>/dev/null || true
-                                echo "[OK] .NET deps ready"
-                            '''
-                            break
-                        default:
-                            echo "[INFO] No dependency install step for: ${env.DETECTED_LANG}"
-                    }
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'DEPS_EOF'
+import json, subprocess, os, sys
 
-                    // --- Universal: also install any frontend (package.json) sub-projects ---
-                    // Runs for ALL primary languages so Python+frontend combos are covered
-                    if (env.DETECTED_LANG != 'nodejs' && env.DETECTED_LANG != 'react' &&
-                        env.DETECTED_LANG != 'angular' && env.DETECTED_LANG != 'vue') {
-                        sh '''
-                            FOUND=$(find . -maxdepth 3 -name 'package.json' \
-                                ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | \
-                                while IFS= read -r pkg; do d=$(dirname "$pkg"); [ "$d" != "." ] && echo "$d"; done | head -3)
-                            if [ -n "$FOUND" ]; then
-                                echo "=== Installing frontend/node sub-module dependencies ==="
-                                echo "$FOUND" | while IFS= read -r d; do
-                                    echo "  [frontend] npm install in: $d"
-                                    (cd "$d" && npm ci 2>/dev/null || npm install 2>/dev/null || true)
-                                done
-                            fi
-                        '''
-                    }
-                }
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    result = subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE)
+    return result.returncode
+
+PIP = 'pip install --break-system-packages --quiet'
+
+for key, m in modules.items():
+    lang = m['language']
+    d    = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    print()
+    print(f'{"="*60}')
+    print(f'  [deps] Module: {key}  lang={lang}  dir={m["dir"] or "."}')
+    print(f'{"="*60}')
+
+    if lang == 'python':
+        for dep_file in m.get('dep_files', []):
+            full = os.path.join(WORKSPACE, dep_file)
+            if not os.path.isfile(full): continue
+            name = os.path.basename(dep_file)
+            if name in ('requirements.txt','requirements-dev.txt','requirements-test.txt'):
+                run(f'{PIP} -r "{full}"')
+            elif name in ('setup.py', 'pyproject.toml'):
+                run(f'{PIP} -e ".[dev,test]" || {PIP} -e .', cwd=d)
+            elif name == 'Pipfile':
+                run(f'pipenv install --dev', cwd=d)
+        # Also install any additional requirements in sub-subdirs not yet listed
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in {'node_modules','.venv','venv',
+                       '.git','pipeline-reports','.trivy-cache','__pycache__'}]
+            if root == d: continue  # root already handled above
+            for f in files:
+                if f.startswith('requirements') and f.endswith('.txt'):
+                    run(f'{PIP} -r "{os.path.join(root, f)}"')
+
+    elif lang == 'java-maven':
+        run('mvn dependency:resolve -q', cwd=d)
+
+    elif lang == 'java-gradle':
+        run('chmod +x gradlew 2>/dev/null; ./gradlew dependencies --quiet 2>/dev/null || gradle dependencies --quiet 2>/dev/null', cwd=d)
+
+    elif lang in ('nodejs', 'react', 'angular', 'vue'):
+        if os.path.isfile(os.path.join(d, 'yarn.lock')):
+            run('yarn install --frozen-lockfile || yarn install', cwd=d)
+        elif os.path.isfile(os.path.join(d, 'pnpm-lock.yaml')):
+            run('pnpm install --frozen-lockfile || pnpm install', cwd=d)
+        elif os.path.isfile(os.path.join(d, 'package.json')):
+            run('npm ci || npm install', cwd=d)
+        # Also install in any nested package dirs (e.g. frontend/src/widget)
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in {'node_modules','.git',
+                       'pipeline-reports','.trivy-cache'}]
+            if root == d: continue
+            if 'package.json' in files:
+                run('npm ci || npm install', cwd=root)
+
+    elif lang == 'go':
+        if os.path.isfile(os.path.join(d, 'go.mod')):
+            run('go mod download && go mod verify', cwd=d)
+
+    elif lang == 'dotnet':
+        proj = next(iter(m.get('dep_files', [])), None)
+        if proj:
+            run(f'dotnet restore "{os.path.join(WORKSPACE, proj)}"')
+
+print()
+print('  [OK] All module dependencies installed')
+DEPS_EOF
+"""
             }
         }
 
         // =====================================================================
-        // STAGE 3: Lint & Code Quality
+        // STAGE 3: Lint & Code Quality (per discovered module)
         // =====================================================================
         stage('Lint & Code Quality') {
             steps {
-                script {
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            sh """
-                                echo "=== Flake8 ==="
-                                flake8 . --max-line-length=120 \
-                                    --exclude=.venv,venv,__pycache__,migrations,.trivy-cache,pipeline-reports \
-                                    --output-file='${REPORTS_DIR}/flake8-report.txt' 2>/dev/null || true
-                                cat '${REPORTS_DIR}/flake8-report.txt' 2>/dev/null | head -30 || true
-                                echo "=== Bandit SAST ==="
-                                bandit -r . -f json -o '${REPORTS_DIR}/bandit-report.json' \
-                                    --exclude .venv,venv,tests,test,.trivy-cache,pipeline-reports 2>/dev/null || true
-                                echo "=== PyLint ==="
-                                find . -name '*.py' -not -path './.venv/*' -not -path './venv/*' \
-                                    -not -path './.trivy-cache/*' -not -path './pipeline-reports/*' \
-                                    | head -30 | xargs pylint --output-format=text --score=yes \
-                                    > '${REPORTS_DIR}/pylint-report.txt' 2>/dev/null || true
-                            """
-                            break
-                        case 'java-maven':
-                            sh 'mvn checkstyle:check -q 2>/dev/null || echo "[INFO] Checkstyle not configured (non-blocking)"'
-                            break
-                        case 'java-gradle':
-                            sh './gradlew checkstyleMain 2>/dev/null || echo "[INFO] Checkstyle not configured (non-blocking)"'
-                            break
-                        case ['nodejs','react','angular','vue']:
-                            sh """
-                                [ -f "node_modules/.bin/eslint" ] && \
-                                    npx eslint . --format json \
-                                    --output-file '${REPORTS_DIR}/eslint-report.json' 2>/dev/null || \
-                                echo "[INFO] ESLint not in project deps"
-                            """
-                            break
-                        case 'go':
-                            sh """
-                                go vet ./... 2>&1 | tee '${REPORTS_DIR}/govet-report.txt' || true
-                                command -v golangci-lint &>/dev/null && \
-                                    golangci-lint run --out-format json > '${REPORTS_DIR}/golangci-lint.json' 2>/dev/null || true
-                            """
-                            break
-                        case 'dotnet':
-                            sh 'dotnet format --verify-no-changes 2>/dev/null || echo "[INFO] Format issues (non-blocking)"'
-                            break
-                    }
-                }
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'LINT_EOF'
+import json, subprocess, os
+
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+
+def run(cmd, cwd=None, capture=False):
+    print(f'  \\$ {cmd}')
+    kwargs = dict(shell=True, cwd=cwd or WORKSPACE)
+    if capture:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+        return r.returncode, (r.stdout or b'').decode(errors='replace')
+    return subprocess.run(cmd, **kwargs).returncode, ''
+
+for key, m in modules.items():
+    lang = m['language']
+    d    = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    print()
+    print(f'{"="*60}')
+    print(f'  [lint] Module: {key}  lang={lang}  dir={m["dir"] or "."}')
+    print(f'{"="*60}')
+
+    safe = key.replace('/', '-')
+
+    if lang == 'python':
+        src = m['dir'] or '.'
+        excl = '.venv,venv,__pycache__,migrations,.trivy-cache,pipeline-reports,.git'
+        run(f'flake8 "{d}" --max-line-length=120 --exclude={excl} '
+            f'--output-file="{REPORTS_DIR}/flake8-{safe}.txt"')
+        run(f'bandit -r "{d}" -f json -o "{REPORTS_DIR}/bandit-{safe}.json" '
+            f'--exclude .venv,venv,tests,test,.trivy-cache,pipeline-reports')
+        py_files = subprocess.run(
+            f'find "{d}" -name "*.py" -not -path "*/.venv/*" -not -path "*/venv/*" '
+            f'-not -path "*/pipeline-reports/*" -not -path "*/__pycache__/*"',
+            shell=True, cwd=WORKSPACE, stdout=subprocess.PIPE
+        ).stdout.decode().split()[:30]
+        if py_files:
+            files_str = ' '.join('"' + f + '"' for f in py_files)
+            run(f'pylint --output-format=text --score=yes {files_str} '
+                f'> "{REPORTS_DIR}/pylint-{safe}.txt" 2>&1')
+
+    elif lang == 'java-maven':
+        run('mvn checkstyle:check -q', cwd=d)
+
+    elif lang == 'java-gradle':
+        run('./gradlew checkstyleMain 2>/dev/null || gradle checkstyleMain', cwd=d)
+
+    elif lang in ('nodejs', 'react', 'angular', 'vue'):
+        if os.path.isfile(os.path.join(d, 'node_modules', '.bin', 'eslint')):
+            run(f'npx eslint . --format json '
+                f'--output-file "{REPORTS_DIR}/eslint-{safe}.json"', cwd=d)
+        elif os.path.isfile(os.path.join(d, 'node_modules', '.bin', 'tslint')):
+            run(f'npx tslint -t json -o "{REPORTS_DIR}/tslint-{safe}.json" '
+                f'"src/**/*.ts"', cwd=d)
+
+    elif lang == 'go':
+        run(f'go vet ./... > "{REPORTS_DIR}/govet-{safe}.txt" 2>&1', cwd=d)
+        run(f'golangci-lint run --out-format json > "{REPORTS_DIR}/golangci-{safe}.json" 2>&1', cwd=d)
+
+    elif lang == 'dotnet':
+        run('dotnet format --verify-no-changes', cwd=d)
+
+print()
+print('  [OK] Lint complete for all modules')
+LINT_EOF
+"""
             }
         }
 
         // =====================================================================
-        // STAGE 4: Unit Testing & Coverage
+        // STAGE 4: Unit Testing & Coverage (per module, per test dir)
         // =====================================================================
         stage('Unit Testing & Coverage') {
             when { expression { params.RUN_UNIT_TESTS } }
             steps {
-                script {
-                    if (env.HAS_TESTS == 'false') {
-                        sh """
-echo "======================================================================"
-echo "  [WARNING] NO TESTS DETECTED — Unit Test Execution SKIPPED"
-echo "======================================================================"
-echo "  Language: ${env.DETECTED_LANG}"
-echo "  Please add tests to the project:"
-echo "    Python:   tests/ with test_*.py files"
-echo "    Java:     src/test/java/ with *Test.java files"
-echo "    Node.js:  __tests__/ or *.test.js files"
-echo "    Go:       *_test.go files"
-echo "    .NET:     *Tests.csproj project"
-echo "======================================================================"
-echo 'NO_TESTS_FOUND' > '${REPORTS_DIR}/test-status.txt'
-echo "[WARNING] No tests found for ${env.DETECTED_LANG}" >> '${REPORTS_DIR}/pipeline-warnings.txt'
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+export COVERAGE_THRESHOLD='${COVERAGE_THRESHOLD}'
+export PYTEST_ARGS='${params.PYTEST_ARGS ?: ''}'
+python3 <<'TEST_EOF'
+import json, subprocess, os, sys
+
+WORKSPACE         = os.environ['WORKSPACE']
+REPORTS_DIR       = os.environ['REPORTS_DIR']
+COVERAGE_THRESHOLD= os.environ.get('COVERAGE_THRESHOLD', '70')
+PYTEST_ARGS       = os.environ.get('PYTEST_ARGS', '')
+modules           = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    rc = subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
+    print(f'     → exit {rc}')
+    return rc
+
+found_tests = False
+
+for key, m in modules.items():
+    lang     = m['language']
+    mod_dir  = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    test_dirs= m.get('test_dirs', [])
+    safe     = key.replace('/', '-')
+
+    if not test_dirs:
+        print(f'  [SKIP] Module {key}: no test directories found')
+        continue
+
+    found_tests = True
+    print()
+    print(f'{"="*60}')
+    print(f'  [test] Module: {key}  lang={lang}')
+    print(f'  Test dirs: {test_dirs}')
+    print(f'{"="*60}')
+
+    if lang == 'python':
+        # Run pytest over ALL test dirs for this module in one invocation
+        test_paths = ' '.join(f'"{os.path.join(WORKSPACE, td)}"' for td in test_dirs)
+        cov_src    = m['dir'] or '.'
+        run(
+            f'python3 -m pytest {test_paths} '
+            f'--junitxml="{REPORTS_DIR}/pytest-{safe}-results.xml" '
+            f'--html="{REPORTS_DIR}/pytest-{safe}-report.html" --self-contained-html '
+            f'--cov="{cov_src}" '
+            f'--cov-report=xml:"{REPORTS_DIR}/coverage-{safe}.xml" '
+            f'--cov-report=html:"{REPORTS_DIR}/htmlcov-{safe}" '
+            f'--cov-report=term-missing '
+            f'--cov-fail-under={COVERAGE_THRESHOLD} '
+            f'--tb=short -v {PYTEST_ARGS}',
+            cwd=WORKSPACE
+        )
+
+    elif lang == 'java-maven':
+        run('mvn test jacoco:report -Dmaven.test.failure.ignore=true', cwd=mod_dir)
+        run(f'cp -r target/surefire-reports/* "{REPORTS_DIR}/" 2>/dev/null; '
+            f'cp target/site/jacoco/jacoco.xml "{REPORTS_DIR}/jacoco-{safe}.xml" 2>/dev/null',
+            cwd=mod_dir)
+
+    elif lang == 'java-gradle':
+        run('./gradlew test jacocoTestReport --continue 2>/dev/null || '
+            'gradle test jacocoTestReport --continue', cwd=mod_dir)
+        run(f'cp -r build/test-results/test/* "{REPORTS_DIR}/" 2>/dev/null; '
+            f'cp build/reports/jacoco/test/jacocoTestReport.xml '
+            f'"{REPORTS_DIR}/jacoco-{safe}.xml" 2>/dev/null',
+            cwd=mod_dir)
+
+    elif lang in ('nodejs', 'react', 'angular', 'vue'):
+        pkg_json = os.path.join(mod_dir, 'package.json')
+        if os.path.isfile(pkg_json):
+            pkg = open(pkg_json).read()
+            if '"test"' in pkg:
+                run(
+                    f'npx jest --ci --coverage '
+                    f'--coverageDirectory="{REPORTS_DIR}/coverage-{safe}" '
+                    f'--coverageReporters=json-summary --coverageReporters=lcov '
+                    f'--reporters=default --reporters=jest-junit '
+                    f'--passWithNoTests 2>/dev/null || '
+                    f'npm test -- --watchAll=false --passWithNoTests 2>/dev/null || '
+                    f'npm test',
+                    cwd=mod_dir
+                )
+            else:
+                print(f'  [INFO] No "test" script in {pkg_json}')
+
+    elif lang == 'go':
+        run(
+            f'go test ./... -v -count=1 '
+            f'-coverprofile="{REPORTS_DIR}/go-coverage-{safe}.out" '
+            f'-json > "{REPORTS_DIR}/go-test-{safe}.json" 2>&1',
+            cwd=mod_dir
+        )
+        run(f'go tool cover -func="{REPORTS_DIR}/go-coverage-{safe}.out" 2>/dev/null | tail -5',
+            cwd=mod_dir)
+        run(f'go tool cover -html="{REPORTS_DIR}/go-coverage-{safe}.out" '
+            f'-o "{REPORTS_DIR}/go-coverage-{safe}.html" 2>/dev/null',
+            cwd=mod_dir)
+
+    elif lang == 'dotnet':
+        run(
+            f'dotnet test '
+            f'--logger "trx;LogFileName={REPORTS_DIR}/dotnet-{safe}.trx" '
+            f'--collect:"XPlat Code Coverage" '
+            f'--results-directory "{REPORTS_DIR}" -v normal',
+            cwd=mod_dir
+        )
+
+if not found_tests:
+    print()
+    print('====================================================================')
+    print('  [WARNING] No test directories found in any module')
+    print('  Ensure your project has one of:')
+    print('    Python   : tests/ or test/ with test_*.py files')
+    print('    Node.js  : __tests__/ or *.test.js / *.spec.js files')
+    print('    Java     : src/test/java/ with *Test.java files')
+    print('    Go       : *_test.go files')
+    print('    .NET     : tests/ or *Tests.csproj project')
+    print('====================================================================')
+    with open(os.path.join(REPORTS_DIR, 'test-status.txt'), 'w') as f:
+        f.write('NO_TESTS_FOUND')
+    with open(os.path.join(REPORTS_DIR, 'pipeline-warnings.txt'), 'a') as f:
+        f.write('[WARNING] No tests found in any module\\n')
+
+TEST_EOF
 """
-                        return
-                    }
-
-                    echo "=== Tests detected — running ${env.DETECTED_LANG} tests ==="
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            // Use the discovered test directory (handles backend/tests, src/tests, etc.)
-                            def pyDir = env.PY_TEST_DIR ?: (fileExists('tests') ? 'tests' : (fileExists('test') ? 'test' : '.'))
-                            echo "=== Running pytest in: ${pyDir} ==="
-                            sh """
-                                python3 -m pytest '${pyDir}' \\
-                                    --junitxml='${REPORTS_DIR}/pytest-unit-results.xml' \\
-                                    --html='${REPORTS_DIR}/pytest-report.html' --self-contained-html \\
-                                    --cov=. \\
-                                    --cov-report=xml:'${REPORTS_DIR}/coverage.xml' \\
-                                    --cov-report=html:'${REPORTS_DIR}/htmlcov' \\
-                                    --cov-report=term-missing \\
-                                    --cov-fail-under=${COVERAGE_THRESHOLD} \\
-                                    --tb=short -v ${params.PYTEST_ARGS ?: ''} 2>&1 || true
-                            """
-                            break
-                        case 'java-maven':
-                            sh """
-                                mvn test jacoco:report -Dmaven.test.failure.ignore=true 2>/dev/null || true
-                                cp -r target/surefire-reports/* '${REPORTS_DIR}/' 2>/dev/null || true
-                                cp target/site/jacoco/jacoco.xml '${REPORTS_DIR}/jacoco-coverage.xml' 2>/dev/null || true
-                            """
-                            break
-                        case 'java-gradle':
-                            sh """
-                                ./gradlew test jacocoTestReport --continue 2>/dev/null || \
-                                    gradle test jacocoTestReport --continue 2>/dev/null || true
-                                cp -r build/test-results/test/* '${REPORTS_DIR}/' 2>/dev/null || true
-                                cp build/reports/jacoco/test/jacocoTestReport.xml \
-                                    '${REPORTS_DIR}/jacoco-coverage.xml' 2>/dev/null || true
-                            """
-                            break
-                        case ['nodejs', 'react', 'angular', 'vue']:
-                            sh """
-                                grep -q '"test"' package.json 2>/dev/null && \
-                                    (npx jest --ci --coverage \
-                                        --coverageDirectory='${REPORTS_DIR}/coverage' \
-                                        --coverageReporters=json-summary --coverageReporters=lcov \
-                                        --reporters=default --reporters=jest-junit 2>/dev/null || \
-                                    npm test 2>/dev/null) || true
-                            """
-                            break
-                        case 'go':
-                            sh """
-                                go test ./... -v -count=1 \
-                                    -coverprofile='${REPORTS_DIR}/go-coverage.out' \
-                                    -json > '${REPORTS_DIR}/go-test-unit.json' 2>&1 || true
-                                go tool cover -func='${REPORTS_DIR}/go-coverage.out' 2>/dev/null | tail -5 || true
-                                go tool cover -html='${REPORTS_DIR}/go-coverage.out' \
-                                    -o '${REPORTS_DIR}/go-coverage.html' 2>/dev/null || true
-                            """
-                            break
-                        case 'dotnet':
-                            sh """
-                                dotnet test \
-                                    --logger "trx;LogFileName=unit-results.trx" \
-                                    --collect:"XPlat Code Coverage" \
-                                    --results-directory '${REPORTS_DIR}' \
-                                    -v normal 2>/dev/null || true
-                            """
-                            break
-                    }
-
-                    // --- Run frontend sub-project tests when primary language is NOT js/ts ---
-                    if (env.FRONTEND_DIR?.trim() &&
-                        !(env.DETECTED_LANG in ['nodejs','react','angular','vue'])) {
-                        sh """
-                            echo "======================================================================"
-                            echo "  Frontend sub-project tests: ${env.FRONTEND_DIR}"
-                            echo "======================================================================"
-                            cd '${env.FRONTEND_DIR}'
-                            if grep -q '"test"' package.json 2>/dev/null; then
-                                npx jest --ci --coverage \
-                                    --coverageDirectory='${REPORTS_DIR}/frontend-coverage' \
-                                    --coverageReporters=json-summary --coverageReporters=lcov \
-                                    --reporters=default --reporters=jest-junit \
-                                    --passWithNoTests 2>/dev/null || \
-                                npm test -- --watchAll=false --passWithNoTests 2>/dev/null || \
-                                npm test 2>/dev/null || true
-                            elif grep -q '"test:unit"' package.json 2>/dev/null; then
-                                npm run test:unit 2>/dev/null || true
-                            else
-                                echo "[INFO] No test script found in ${env.FRONTEND_DIR}/package.json"
-                            fi
-                        """
-                    }
-                }
             }
             post {
                 always {
@@ -669,201 +931,201 @@ echo "[WARNING] No tests found for ${env.DETECTED_LANG}" >> '${REPORTS_DIR}/pipe
         }
 
         // =====================================================================
-        // STAGE 5: Integration Tests (optional)
+        // STAGE 5: Integration Tests (optional, per module)
         // =====================================================================
         stage('Integration Tests') {
             when { expression { params.RUN_INTEGRATION_TESTS } }
             steps {
-                script {
-                    def intFound = false
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            intFound = fileExists('tests/integration') || fileExists('test/integration')
-                            break
-                        case 'java-maven': case 'java-gradle':
-                            intFound = sh(script: "find . -maxdepth 5 -name '*IT.java' -o -name '*IntegrationTest.java' 2>/dev/null | head -1", returnStdout: true).trim()
-                            break
-                        case 'nodejs': case 'react': case 'angular': case 'vue':
-                            intFound = fileExists('test/integration') || fileExists('tests/integration') ||
-                                sh(script: "grep -q '\"test:integration\"' package.json 2>/dev/null && echo yes || true", returnStdout: true).trim()
-                            break
-                        case 'go':
-                            intFound = sh(script: "grep -rl '//go:build integration' . --include='*_test.go' 2>/dev/null | head -1", returnStdout: true).trim()
-                            break
-                        default:
-                            intFound = fileExists('tests/integration') || fileExists('test/integration')
-                    }
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'INTTEST_EOF'
+import json, subprocess, os, glob
 
-                    if (!intFound) {
-                        echo "[WARNING] No integration tests detected — skipping integration test stage"
-                        return
-                    }
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            sh """
-                                python3 -m pytest tests/integration/ \
-                                    --junitxml='${REPORTS_DIR}/pytest-integration-results.xml' \
-                                    -v -m 'integration' 2>/dev/null || true
-                            """
-                            break
-                        case 'java-maven':
-                            sh 'mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true 2>/dev/null || true'
-                            break
-                        case ['nodejs','react','angular','vue']:
-                            sh "grep -q '\"test:integration\"' package.json 2>/dev/null && npm run test:integration || echo '[INFO] No integration test script'"
-                            break
-                        case 'go':
-                            sh """
-                                go test ./... -v -tags=integration \
-                                    -json > '${REPORTS_DIR}/go-integration.json' 2>&1 || true
-                            """
-                            break
-                    }
-                }
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
+
+int_names = {'integration', 'e2e', 'functional', 'acceptance', 'api'}
+
+for key, m in modules.items():
+    lang    = m['language']
+    d       = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    safe    = key.replace('/', '-')
+
+    # Find integration test dirs inside this module
+    int_dirs = [td for td in m.get('test_dirs', [])
+                if any(n in td.lower() for n in int_names)]
+
+    # Fallback: search for integration patterns
+    if not int_dirs:
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in {'node_modules','.git','pipeline-reports','.trivy-cache','.venv','venv'}]
+            base = os.path.basename(root)
+            if base in int_names:
+                int_dirs.append(os.path.relpath(root, WORKSPACE))
+
+    if not int_dirs:
+        print(f'  [SKIP] Module {key}: no integration test dirs found')
+        continue
+
+    print(f'  [int-test] Module {key}  lang={lang}  dirs={int_dirs}')
+
+    if lang == 'python':
+        paths = ' '.join('"' + os.path.join(WORKSPACE, td) + '"' for td in int_dirs)
+        run(f'python3 -m pytest {paths} '
+            f'--junitxml="{REPORTS_DIR}/pytest-integration-{safe}.xml" '
+            f'-v -m integration', cwd=WORKSPACE)
+
+    elif lang == 'java-maven':
+        run('mvn verify -DskipUTs=true -Dmaven.test.failure.ignore=true', cwd=d)
+
+    elif lang in ('nodejs', 'react', 'angular', 'vue'):
+        pkg = open(os.path.join(d, 'package.json')).read() if os.path.isfile(os.path.join(d, 'package.json')) else ''
+        if '"test:integration"' in pkg:
+            run('npm run test:integration', cwd=d)
+        elif '"test:e2e"' in pkg:
+            run('npm run test:e2e', cwd=d)
+
+    elif lang == 'go':
+        run(f'go test ./... -v -tags=integration '
+            f'-json > "{REPORTS_DIR}/go-integration-{safe}.json" 2>&1', cwd=d)
+
+INTTEST_EOF
+"""
             }
         }
 
         // =====================================================================
-        // STAGE 6: CycloneDX SBOM Generation
+        // STAGE 6: CycloneDX SBOM Generation (per module + full workspace)
         // =====================================================================
         stage('CycloneDX SBOM Generation') {
             when { expression { params.GENERATE_SBOM } }
             steps {
-                script {
-                    echo "=== Stage 6: CycloneDX SBOM Generation (${env.DETECTED_LANG}) ==="
-                    switch (env.DETECTED_LANG) {
-                        case 'python':
-                            sh """
-                                [ -f "requirements.txt" ] && \
-                                    (cyclonedx-py requirements -i requirements.txt --output-format json \
-                                        -o '${REPORTS_DIR}/sbom/sbom-python-requirements.json' 2>/dev/null || true) || true
-                                cyclonedx-py environment --output-format json \
-                                    -o '${REPORTS_DIR}/sbom/sbom-python-environment.json' 2>/dev/null || true
-                                pip-audit --format=cyclonedx-json \
-                                    --output='${REPORTS_DIR}/sbom/sbom-python-pip-audit.json' 2>/dev/null || true
-                                # Text format pip-audit report for human-readable review
-                                pip-audit --format=columns \
-                                    --output='${REPORTS_DIR}/sbom/sbom-python-pip-audit.txt' 2>/dev/null || \
-                                pip-audit > '${REPORTS_DIR}/sbom/sbom-python-pip-audit.txt' 2>/dev/null || true
-                                # Also scan any subdir requirements.txt files
-                                find . -maxdepth 3 -name 'requirements*.txt' \
-                                    ! -path './.venv/*' ! -path './venv/*' ! -path '*/pipeline-reports/*' | \
-                                while IFS= read -r req; do
-                                    [ "\$(dirname "\$req")" = "." ] && continue
-                                    SAFE=\$(echo "\$req" | tr '/' '-' | sed 's/^-*//')
-                                    echo "  SBOM for: \$req"
-                                    pip-audit --format=cyclonedx-json \
-                                        --output='${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.json' \
-                                        -r "\$req" 2>/dev/null || true
-                                    pip-audit -r "\$req" > '${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.txt' 2>/dev/null || true
-                                done
-                            """
-                            break
-                        case 'java-maven':
-                            sh """
-                                mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.11:makeAggregateBom \
-                                    -DoutputFormat=json -DoutputName=sbom-java-maven \
-                                    -DoutputDirectory='${REPORTS_DIR}/sbom' -q 2>/dev/null || true
-                            """
-                            break
-                        case 'java-gradle':
-                            sh """
-                                (./gradlew cyclonedxBom 2>/dev/null || gradle cyclonedxBom 2>/dev/null) && \
-                                    cp build/reports/bom.json '${REPORTS_DIR}/sbom/sbom-java-gradle.json' 2>/dev/null || true
-                            """
-                            break
-                        case ['nodejs','react','angular','vue']:
-                            sh """
-                                npx @cyclonedx/cyclonedx-npm --output-format JSON \
-                                    --output-file '${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json' \
-                                    --ignore-npm-errors 2>/dev/null || \
-                                npm sbom --sbom-format cyclonedx --omit dev \
-                                    > '${REPORTS_DIR}/sbom/sbom-${env.DETECTED_LANG}.json' 2>/dev/null || true
-                                npm audit --json > '${REPORTS_DIR}/sbom/npm-audit.json' 2>/dev/null || true
-                            """
-                            break
-                        case 'go':
-                            sh """
-                                command -v cyclonedx-gomod &>/dev/null && \
-                                    cyclonedx-gomod mod -json \
-                                    -output '${REPORTS_DIR}/sbom/sbom-go.json' 2>/dev/null || true
-                            """
-                            break
-                        case 'dotnet':
-                            sh """
-                                CSPROJ=\$(find . -maxdepth 2 -name '*.csproj' | head -1)
-                                [ -n "\${CSPROJ}" ] && dotnet CycloneDX "\${CSPROJ}" --json \
-                                    --output '${REPORTS_DIR}/sbom' --filename 'sbom-dotnet.json' 2>/dev/null || true
-                            """
-                            break
-                    }
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'SBOM_EOF'
+import json, subprocess, os
 
-                    sh """
-                        echo "=== Trivy CycloneDX SBOM (full filesystem) ==="
-                        trivy fs --format cyclonedx \
-                            --output '${REPORTS_DIR}/sbom/sbom-trivy-cyclonedx.json' \
-                            '${WORKSPACE}' 2>/dev/null || true
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+SBOM_DIR    = os.path.join(REPORTS_DIR, 'sbom')
+os.makedirs(SBOM_DIR, exist_ok=True)
+modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
-                        echo "=== Trivy SPDX SBOM ==="
-                        trivy fs --format spdx-json \
-                            --output '${REPORTS_DIR}/sbom/sbom-trivy-spdx.json' \
-                            '${WORKSPACE}' 2>/dev/null || true
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
 
-                        echo "=== Trivy SBOM — Text / Table format (all dependencies) ==="
-                        trivy fs --format table \
-                            --output '${REPORTS_DIR}/sbom/sbom-all-dependencies.txt' \
-                            '${WORKSPACE}' 2>/dev/null || true
-                        echo "=== Trivy SCA — Vulnerability + License report (text) ==="
-                        trivy fs --scanners vuln,license \
-                            --severity CRITICAL,HIGH,MEDIUM,LOW \
-                            --format table \
-                            --output '${REPORTS_DIR}/sbom/sbom-vuln-license-report.txt' \
-                            '${WORKSPACE}' 2>/dev/null || true
+for key, m in modules.items():
+    lang    = m['language']
+    d       = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    safe    = key.replace('/', '-')
+    print(f'\\n{"="*60}')
+    print(f'  [sbom] Module: {key}  lang={lang}')
+    print(f'{"="*60}')
 
-                        echo "=== Scanning subdirectories for additional manifests ==="
-                        find . -maxdepth 3 -name 'requirements.txt' \
-                            ! -path './.venv/*' ! -path './venv/*' ! -path './pipeline-reports/*' | \
-                            while read req; do
-                                DIR=\$(dirname "\$req"); [ "\$DIR" = "." ] && continue
-                                SAFE=\$(echo "\$DIR" | tr '/' '-' | sed 's/^-*//')
-                                echo "  Generating SBOM for: \$req"
-                                pip-audit --format=cyclonedx-json \
-                                    --output='${REPORTS_DIR}/sbom/sbom-python-'\${SAFE}'.json' \
-                                    -r "\$req" 2>/dev/null || true
-                            done
+    if lang == 'python':
+        for dep in m.get('dep_files', []):
+            fp = os.path.join(WORKSPACE, dep)
+            if not os.path.isfile(fp): continue
+            name = os.path.basename(dep)
+            dep_safe = dep.replace('/', '-').lstrip('-')
+            if name.startswith('requirements') and name.endswith('.txt'):
+                run(f'cyclonedx-py requirements -i "{fp}" --output-format json '
+                    f'-o "{SBOM_DIR}/sbom-python-{dep_safe}.json"')
+                run(f'pip-audit -r "{fp}" --format=cyclonedx-json '
+                    f'-o "{SBOM_DIR}/sbom-audit-{dep_safe}.json" 2>/dev/null; '
+                    f'pip-audit -r "{fp}" > "{SBOM_DIR}/sbom-audit-{dep_safe}.txt" 2>/dev/null')
+        run(f'cyclonedx-py environment --output-format json '
+            f'-o "{SBOM_DIR}/sbom-python-env-{safe}.json"')
 
-                        find . -maxdepth 3 -name 'package.json' \
-                            ! -path '*/node_modules/*' ! -path './pipeline-reports/*' | \
-                            while read pkg; do
-                                DIR=\$(dirname "\$pkg"); [ "\$DIR" = "." ] && continue
-                                SAFE=\$(echo "\$DIR" | tr '/' '-' | sed 's/^-*//')
-                                echo "  Generating SBOM for: \$pkg"
-                                (cd "\$DIR" && npx @cyclonedx/cyclonedx-npm --output-format JSON \
-                                    --output-file '${REPORTS_DIR}/sbom/sbom-nodejs-'\${SAFE}'.json' \
-                                    --ignore-npm-errors 2>/dev/null || true)
-                            done
-                    """
+    elif lang == 'java-maven':
+        run('mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.11:makeAggregateBom '
+            f'-DoutputFormat=json -DoutputName=sbom-maven-{safe} '
+            f'-DoutputDirectory="{SBOM_DIR}" -q', cwd=d)
 
-                    sh '''
+    elif lang == 'java-gradle':
+        run('./gradlew cyclonedxBom 2>/dev/null || gradle cyclonedxBom', cwd=d)
+        run(f'cp build/reports/bom.json "{SBOM_DIR}/sbom-gradle-{safe}.json" 2>/dev/null', cwd=d)
+
+    elif lang in ('nodejs', 'react', 'angular', 'vue'):
+        run(f'npx @cyclonedx/cyclonedx-npm --output-format JSON '
+            f'--output-file "{SBOM_DIR}/sbom-{lang}-{safe}.json" '
+            f'--ignore-npm-errors 2>/dev/null || '
+            f'npm sbom --sbom-format cyclonedx --omit dev '
+            f'> "{SBOM_DIR}/sbom-{lang}-{safe}.json" 2>/dev/null', cwd=d)
+        run(f'npm audit --json > "{SBOM_DIR}/npm-audit-{safe}.json" 2>/dev/null', cwd=d)
+
+    elif lang == 'go':
+        run(f'cyclonedx-gomod mod -json '
+            f'-output "{SBOM_DIR}/sbom-go-{safe}.json"', cwd=d)
+
+    elif lang == 'dotnet':
+        import glob
+        csproj_files = glob.glob(os.path.join(d, '*.csproj'))
+        for cp in csproj_files[:1]:
+            cp_safe = os.path.basename(cp).replace('.csproj', '')
+            run(f'dotnet CycloneDX "{cp}" --json '
+                f'--output "{SBOM_DIR}" --filename "sbom-dotnet-{cp_safe}.json"')
+
+print()
+print('  [sbom] Running Trivy full-workspace SBOM (CycloneDX JSON)...')
+SBOM_EOF
+"""
+
+                // Trivy workspace-wide SBOMs
+                sh """
+                    trivy fs --format cyclonedx \
+                        --output '${REPORTS_DIR}/sbom/sbom-trivy-cyclonedx.json' \
+                        '${WORKSPACE}' 2>/dev/null || true
+
+                    trivy fs --format spdx-json \
+                        --output '${REPORTS_DIR}/sbom/sbom-trivy-spdx.json' \
+                        '${WORKSPACE}' 2>/dev/null || true
+
+                    # ── Human-readable text reports ──────────────────────────
+                    trivy fs --format table \
+                        --output '${REPORTS_DIR}/sbom/sbom-all-dependencies.txt' \
+                        '${WORKSPACE}' 2>/dev/null || true
+
+                    trivy fs --scanners vuln,license \
+                        --severity CRITICAL,HIGH,MEDIUM,LOW \
+                        --format table \
+                        --output '${REPORTS_DIR}/sbom/sbom-vuln-license-report.txt' \
+                        '${WORKSPACE}' 2>/dev/null || true
+                """
+
+                // Summary
+                sh '''
 python3 <<'PYEOF'
 import json, os, glob
 sbom_dir = os.path.join(os.environ.get("REPORTS_DIR", "."), "sbom")
 total = 0
-files = sorted(glob.glob(os.path.join(sbom_dir, "sbom-*.json")))
-print("  SBOM Files:")
-for sf in files:
+jfiles = sorted(glob.glob(os.path.join(sbom_dir, "sbom-*.json")))
+tfiles = sorted(glob.glob(os.path.join(sbom_dir, "sbom-*.txt")) +
+                glob.glob(os.path.join(sbom_dir, "*-audit-*.txt")))
+print("  SBOM JSON Files:")
+for sf in jfiles:
     try:
         with open(sf) as f: data = json.load(f)
         n = len(data.get("components", []))
         total += n
-        print("    %-52s  %d components" % (os.path.basename(sf), n))
+        print("    %-55s  %d components" % (os.path.basename(sf), n))
     except Exception as e:
-        print("    %-52s  ERROR: %s" % (os.path.basename(sf), str(e)))
-print("  TOTAL: %d components across %d SBOM files" % (total, len(files)))
+        print("    %-55s  ERROR: %s" % (os.path.basename(sf), str(e)))
+print(f"  TOTAL: {total} components across {len(jfiles)} SBOM files")
+if tfiles:
+    print("  SBOM Text Reports (human-readable):")
+    for t in tfiles:
+        print("    " + os.path.basename(t))
 PYEOF
 '''
-                }
             }
         }
 
@@ -975,56 +1237,95 @@ PYEOF
         }
 
         // =====================================================================
-        // STAGE 8: Build Application
+        // STAGE 8: Build Application (per module, Makefile-first, language fallback)
         // =====================================================================
         stage('Build Application') {
             steps {
-                script {
-                    def mkDir = env.MAKEFILE_DIR ?: ''
-                    def cdMk  = mkDir ? "cd '${mkDir}' && " : ''
-                    if (env.HAS_MAKEFILE == 'true' && env.MAKE_BUILD_TARGET) {
-                        echo "=== Build via Makefile: ${env.MAKEFILE_PATH} → target: ${env.MAKE_BUILD_TARGET} ==="
-                        sh """
-                            ${cdMk}make ${env.MAKE_BUILD_TARGET} \
-                                IMAGE_NAME="\${REGISTRY}/\${IMAGE_NAME:-app}:\${IMAGE_TAG:-latest}" \
-                                REGISTRY="\${REGISTRY}" TAG="\${IMAGE_TAG:-latest}" 2>&1 || \
-                            ${cdMk}make ${env.MAKE_BUILD_TARGET} 2>&1 || true
-                        """
-                    } else if (env.HAS_MAKEFILE == 'true') {
-                        sh "${cdMk}make build 2>/dev/null || ${cdMk}make all 2>/dev/null || ${cdMk}make 2>/dev/null || echo '[INFO] No suitable make target'"
-                    } else {
-                        switch (env.DETECTED_LANG) {
-                            case 'python':
-                                sh '''
-                                    if [ -f "setup.py" ]; then
-                                        python3 setup.py bdist_wheel 2>/dev/null || true
-                                    elif [ -f "pyproject.toml" ]; then
-                                        pip install --break-system-packages build 2>/dev/null || true
-                                        python3 -m build 2>/dev/null || true
-                                    else echo "[INFO] No build step for Python script project"; fi
-                                '''
-                                break
-                            case 'java-maven': sh 'mvn package -DskipTests -q 2>/dev/null || true'; break
-                            case 'java-gradle': sh './gradlew build -x test 2>/dev/null || gradle build -x test 2>/dev/null || true'; break
-                            case ['nodejs','react','angular','vue']:
-                                sh 'grep -q \'"build"\' package.json 2>/dev/null && npm run build || echo "[INFO] No build script"'
-                                break
-                            case 'go':
-                                sh """
-                                    CGO_ENABLED=0 go build -o '${REPORTS_DIR}/app-binary' ./... 2>/dev/null || \
-                                        go build ./... 2>/dev/null || true
-                                """
-                                break
-                            case 'dotnet': sh 'dotnet build --configuration Release 2>/dev/null || true'; break
-                            default: echo "[INFO] No build configured for ${env.DETECTED_LANG}"
-                        }
-                    }
-                }
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+export REGISTRY='${REGISTRY}'
+export IMAGE_TAG='${params.IMAGE_TAG ?: 'latest'}'
+export IMAGE_NAME='${params.IMAGE_NAME ?: ''}'
+python3 <<'BUILD_EOF'
+import json, subprocess, os
+
+WORKSPACE  = os.environ['WORKSPACE']
+REPORTS_DIR= os.environ['REPORTS_DIR']
+REGISTRY   = os.environ.get('REGISTRY', '')
+IMAGE_TAG  = os.environ.get('IMAGE_TAG', 'latest')
+IMAGE_NAME = os.environ.get('IMAGE_NAME', '')
+modules    = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
+
+for key, m in modules.items():
+    lang     = m['language']
+    d        = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    safe     = key.replace('/', '-')
+    makefiles= m.get('makefiles', [])
+    print(f'\\n{"="*60}')
+    print(f'  [build] Module: {key}  lang={lang}  dir={m["dir"] or "."}')
+    print(f'{"="*60}')
+
+    if makefiles:
+        for mf in makefiles:
+            mf_dir  = os.path.join(WORKSPACE, mf['dir']) if mf['dir'] else WORKSPACE
+            target  = mf.get('build_target') or mf.get('docker_target', '')
+            print(f'  Makefile: {mf["path"]}  target: {target or "(default)"}')
+            img = f'{REGISTRY}/{IMAGE_NAME}:{IMAGE_TAG}' if IMAGE_NAME else ''
+            # Try with image args first, then without (for Makefiles that don't accept them)
+            if target:
+                rc = run(
+                    f'make -f "{os.path.join(WORKSPACE, mf["path"])}" {target} '
+                    f'IMAGE_NAME="{img}" REGISTRY="{REGISTRY}" TAG="{IMAGE_TAG}"',
+                    cwd=mf_dir
+                )
+                if rc != 0:
+                    run(f'make -f "{os.path.join(WORKSPACE, mf["path"])}" {target}',
+                        cwd=mf_dir)
+            else:
+                rc = run(f'make -f "{os.path.join(WORKSPACE, mf["path"])}" build '
+                         f'IMAGE_NAME="{img}" REGISTRY="{REGISTRY}" TAG="{IMAGE_TAG}"',
+                         cwd=mf_dir)
+                if rc != 0:
+                    run(f'make -f "{os.path.join(WORKSPACE, mf["path"])}"', cwd=mf_dir)
+    else:
+        # No Makefile — run language-specific build
+        if lang == 'python':
+            if os.path.isfile(os.path.join(d, 'pyproject.toml')):
+                run('pip install --break-system-packages build && python3 -m build', cwd=d)
+            elif os.path.isfile(os.path.join(d, 'setup.py')):
+                run('python3 setup.py bdist_wheel', cwd=d)
+            else:
+                print('  [INFO] Python script project — no wheel build needed')
+        elif lang == 'java-maven':
+            run('mvn package -DskipTests -q', cwd=d)
+        elif lang == 'java-gradle':
+            run('./gradlew build -x test 2>/dev/null || gradle build -x test', cwd=d)
+        elif lang in ('nodejs', 'react', 'angular', 'vue'):
+            pkg = open(os.path.join(d, 'package.json')).read() if os.path.isfile(os.path.join(d, 'package.json')) else ''
+            if '"build"' in pkg:
+                run('npm run build', cwd=d)
+            else:
+                print('  [INFO] No "build" script in package.json')
+        elif lang == 'go':
+            run(f'CGO_ENABLED=0 go build -o "{REPORTS_DIR}/app-{safe}" ./...', cwd=d)
+        elif lang == 'dotnet':
+            run('dotnet build --configuration Release', cwd=d)
+
+print()
+print('  [OK] Build stage complete for all modules')
+BUILD_EOF
+"""
             }
         }
 
         // =====================================================================
-        // STAGE 9: Docker / Container Build (Makefile-first)
+        // STAGE 9: Docker / Container Build — builds image for EACH Dockerfile
+        //          discovered across ALL modules (Makefile docker target first)
         // =====================================================================
         stage('Docker Build & Push') {
             steps {
@@ -1036,84 +1337,113 @@ PYEOF
                         sh """
 echo "======================================================================"
 echo "  [WARNING] IMAGE_NAME is not set — Docker build SKIPPED"
-echo "======================================================================"
 echo "  Set the IMAGE_NAME parameter to enable container image build."
 echo "======================================================================"
 echo 'IMAGE_NAME not set — Docker build skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
 """
                         return
                     }
+                }
 
-                    def dfPath = params.DOCKERFILE_PATH ?: 'Dockerfile'
-                    // If parametered path doesn't exist, pick first from recursively discovered Dockerfiles
-                    if (!fileExists(dfPath)) {
-                        def firstFound = (env.ALL_DOCKERFILES ?: '').trim().split(/\s+/).find { it.trim() && it != dfPath } ?: ''
-                        if (firstFound) {
-                            echo "[INFO] Dockerfile not at '${dfPath}' — using discovered: ${firstFound}"
-                            dfPath = firstFound
-                        } else if (fileExists('Containerfile')) {
-                            dfPath = 'Containerfile'
-                        }
-                    }
-                    echo "[INFO] Dockerfiles found: ${env.ALL_DOCKERFILES ?: '(none)'}"
+                sh """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+export REGISTRY='${REGISTRY}'
+export IMAGE_NAME='${params.IMAGE_NAME ?: ''}'
+export IMAGE_TAG='${params.IMAGE_TAG ?: 'latest'}'
+python3 <<'DOCKER_EOF'
+import json, subprocess, os
 
-                    def makeDockerTarget = env.MAKE_BUILD_TARGET in ['docker-build','build-image','image','docker','container'] ?
-                        env.MAKE_BUILD_TARGET : ''
-                    def mkDir2 = env.MAKEFILE_DIR ?: ''
-                    def cdMk2  = mkDir2 ? "cd '${mkDir2}' && " : ''
+WORKSPACE  = os.environ['WORKSPACE']
+REPORTS_DIR= os.environ['REPORTS_DIR']
+REGISTRY   = os.environ.get('REGISTRY', '')
+IMAGE_NAME = os.environ.get('IMAGE_NAME', '')
+IMAGE_TAG  = os.environ.get('IMAGE_TAG', 'latest')
+modules    = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+built_images = []
 
-                    if (!fileExists(dfPath) && env.HAS_MAKEFILE == 'false') {
-                        sh """
-echo "======================================================================"
-echo "  [WARNING] No Dockerfile/Containerfile AND no Makefile found"
-echo "  Docker build SKIPPED — please add a Dockerfile or Makefile target"
-echo "  Searched paths: ${env.ALL_DOCKERFILES ?: 'none'}"
-echo "======================================================================"
-echo 'No Dockerfile AND no Makefile — Docker build skipped' >> '${REPORTS_DIR}/pipeline-warnings.txt'
+def run(cmd, cwd=None):
+    print(f'  \\$ {cmd}')
+    return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
+
+def build_image(tag, dockerfile, context):
+    """Try podman first, then docker."""
+    for rt in ('podman', 'docker'):
+        if subprocess.run(f'command -v {rt}', shell=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            push_flag = '--tls-verify=false' if rt == 'podman' else ''
+            rc = run(f'{rt} build -t "{tag}" -f "{dockerfile}" "{context}"')
+            if rc == 0:
+                run(f'{rt} push "{tag}" {push_flag}')
+                return True
+    print('  [WARN] No container runtime (podman/docker) found on agent')
+    return False
+
+for key, m in modules.items():
+    d        = os.path.join(WORKSPACE, m['dir']) if m['dir'] else WORKSPACE
+    makefiles= m.get('makefiles', [])
+    dfs      = m.get('dockerfiles', [])
+    safe     = key.replace('/', '-')
+
+    if not dfs and not any(mf.get('docker_target') for mf in makefiles):
+        continue
+
+    print(f'\\n{"="*60}')
+    print(f'  [docker] Module: {key}  dockerfiles={dfs}')
+    print(f'{"="*60}')
+
+    # Determine image tag: base-name from module key
+    tag_name = IMAGE_NAME if key == 'root' else f'{IMAGE_NAME}-{safe}'
+    full_tag = f'{REGISTRY}/{tag_name}:{IMAGE_TAG}' if REGISTRY else f'{tag_name}:{IMAGE_TAG}'
+    img_args = f'IMAGE_NAME="{full_tag}" REGISTRY="{REGISTRY}" TAG="{IMAGE_TAG}"'
+
+    # Prefer Makefile docker target
+    mk_built = False
+    for mf in makefiles:
+        dt = mf.get('docker_target', '')
+        if not dt: continue
+        mf_dir = os.path.join(WORKSPACE, mf['dir']) if mf['dir'] else WORKSPACE
+        print(f'  Makefile docker target: {mf["path"]} → {dt}')
+        rc = run(f'make -f "{os.path.join(WORKSPACE, mf["path"])}" {dt} {img_args}',
+                 cwd=mf_dir)
+        if rc != 0:
+            rc = run(f'make -f "{os.path.join(WORKSPACE, mf["path"])}" {dt}', cwd=mf_dir)
+        if rc == 0:
+            mk_built = True
+            built_images.append(full_tag)
+            break
+
+    # Fall back to direct docker/podman build for each Dockerfile
+    if not mk_built:
+        for idx, df in enumerate(dfs):
+            df_abs = os.path.join(WORKSPACE, df)
+            ctx    = os.path.dirname(df_abs)
+            # For multi-Dockerfile modules, suffix the image name
+            img_tag = full_tag if idx == 0 else f'{REGISTRY}/{tag_name}-{os.path.basename(os.path.dirname(df))}:{IMAGE_TAG}'
+            print(f'  Building from: {df} → {img_tag}')
+            if build_image(img_tag, df_abs, ctx):
+                built_images.append(img_tag)
+
+# Write built images list for downstream use (Trivy scan)
+with open(os.path.join(REPORTS_DIR, 'built-images.txt'), 'w') as f:
+    f.write('\\n'.join(built_images))
+if built_images:
+    print(f'\\n  [OK] Built images: {built_images}')
+else:
+    print('  [WARN] No images were successfully built')
+DOCKER_EOF
 """
-                        return
+
+                script {
+                    // Set BUILT_IMAGE to first built image for Trivy scan
+                    def builtFile = "${REPORTS_DIR}/built-images.txt"
+                    if (fileExists(builtFile)) {
+                        def lines = readFile(builtFile).trim().split('\n')
+                        env.BUILT_IMAGE = lines ? lines[0].trim() : ''
                     }
-
-                    def fullImage = "${REGISTRY}/${imageName}:${params.IMAGE_TAG}"
-
-                    if (env.HAS_MAKEFILE == 'true' && makeDockerTarget) {
-                        echo "=== Building image via Makefile (${env.MAKEFILE_PATH}): make ${makeDockerTarget} ==="
-                        sh """
-                            ${cdMk2}make ${makeDockerTarget} \
-                                IMAGE_NAME="${fullImage}" \
-                                REGISTRY="${REGISTRY}" \
-                                TAG="${params.IMAGE_TAG}" 2>&1 || \
-                            ${cdMk2}make ${makeDockerTarget} 2>&1 || true
-                        """
-                    } else {
-                        sh """
-                            echo "=== Building image: ${fullImage} from ${dfPath} ==="
-                            BUILD_CONTEXT=\$(dirname ${dfPath})
-                            [ "\$BUILD_CONTEXT" = "." ] && BUILD_CONTEXT="."
-                            if command -v podman &>/dev/null; then
-                                podman build -t '${fullImage}' -f '${dfPath}' "\$BUILD_CONTEXT" && \
-                                podman push '${fullImage}' --tls-verify=false 2>/dev/null || true
-                                echo "[OK] Podman build+push complete"
-                            elif command -v docker &>/dev/null; then
-                                docker build -t '${fullImage}' -f '${dfPath}' "\$BUILD_CONTEXT" && \
-                                docker push '${fullImage}' 2>/dev/null || true
-                                echo "[OK] Docker build+push complete"
-                            else
-                                echo "[WARNING] No container runtime (podman/docker) found on agent"
-                                echo 'No container runtime found on agent' >> '${REPORTS_DIR}/pipeline-warnings.txt'
-                            fi
-                        """
+                    if (env.BUILT_IMAGE) {
+                        echo "[OK] Primary image for Trivy scan: ${env.BUILT_IMAGE}"
                     }
-
-                    // Check if image exists locally for trivy scan
-                    def imgCheck = sh(script: """
-                        (command -v podman &>/dev/null && podman image exists '${fullImage}' 2>/dev/null && echo yes) || \
-                        (command -v docker &>/dev/null && docker image inspect '${fullImage}' &>/dev/null && echo yes) || \
-                        echo no
-                    """, returnStdout: true).trim()
-
-                    env.BUILT_IMAGE = fullImage    // always set for trivy (it can pull from registry)
-                    echo "[OK] Image for Trivy scan: ${fullImage} (local: ${imgCheck})"
                 }
             }
         }
@@ -1282,34 +1612,61 @@ echo 'No Dockerfile found — Hadolint skipped' >> '${REPORTS_DIR}/pipeline-warn
                         return
                     }
                     sh """
-                        # Lint ALL discovered Dockerfiles (root + subdirectories)
-                        ALL_DFS='${env.ALL_DOCKERFILES ?: ''}'
-                        [ -z "\$ALL_DFS" ] && [ -f '${params.DOCKERFILE_PATH ?: 'Dockerfile'}' ] && ALL_DFS='${params.DOCKERFILE_PATH ?: 'Dockerfile'}'
-                        [ -z "\$ALL_DFS" ] && [ -f "Containerfile" ] && ALL_DFS="Containerfile"
-                        [ -z "\$ALL_DFS" ] && { echo "[INFO] No Dockerfiles to lint"; } && exit 0
-                        echo "=== Linting Dockerfiles: \$ALL_DFS ==="
-                        > '${REPORTS_DIR}/hadolint.txt'
-                        HADOLINT_JSON_PARTS=""
-                        for DFILE in \$ALL_DFS; do
-                            [ -f "\$DFILE" ] || continue
-                            echo "--- \$DFILE ---" >> '${REPORTS_DIR}/hadolint.txt'
-                            if command -v hadolint &>/dev/null; then
-                                hadolint "\$DFILE" 2>&1 >> '${REPORTS_DIR}/hadolint.txt' || true
-                                SAFE=\$(echo "\$DFILE" | tr '/' '-' | sed 's/^-//')
-                                hadolint --format json "\$DFILE" \
-                                    > '${REPORTS_DIR}/hadolint-'\${SAFE}'.json' 2>/dev/null || true
-                            else
-                                echo "[WARN] Hadolint unavailable for \$DFILE — using Trivy config scan"
-                                SAFE=\$(echo "\$DFILE" | tr '/' '-' | sed 's/^-//')
-                                trivy config --severity '${SCAN_SEVERITY}' --format table \
-                                    "\$DFILE" 2>/dev/null >> '${REPORTS_DIR}/hadolint.txt' || true
-                                trivy config --severity '${SCAN_SEVERITY}' --format json \
-                                    --output '${REPORTS_DIR}/trivy-dockerfile-'\${SAFE}'.json' "\$DFILE" 2>/dev/null || true
-                            fi
-                        done
-                        echo "=== Hadolint Summary ==="
-                        cat '${REPORTS_DIR}/hadolint.txt' 2>/dev/null || true
-                    """
+export REPORTS_DIR='${REPORTS_DIR}'
+export WORKSPACE='${WORKSPACE}'
+python3 <<'HADOLINT_EOF'
+import json, subprocess, os
+
+WORKSPACE   = os.environ['WORKSPACE']
+REPORTS_DIR = os.environ['REPORTS_DIR']
+modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
+
+# Collect all Dockerfiles from all modules (deduped, in order)
+seen = set()
+all_dfs = []
+for m in modules.values():
+    for df in m.get('dockerfiles', []):
+        if df not in seen:
+            seen.add(df)
+            all_dfs.append(df)
+
+if not all_dfs:
+    print('  [INFO] No Dockerfiles found in any module — hadolint skipped')
+    exit(0)
+
+print(f'  Linting {len(all_dfs)} Dockerfile(s): {all_dfs}')
+hadolint_txt = os.path.join(REPORTS_DIR, 'hadolint.txt')
+open(hadolint_txt, 'w').close()
+
+for df in all_dfs:
+    df_abs = os.path.join(WORKSPACE, df)
+    if not os.path.isfile(df_abs):
+        print(f'  [WARN] Not found: {df_abs}')
+        continue
+    safe = df.replace('/', '-').lstrip('-')
+    print(f'\\n  --- {df} ---')
+    with open(hadolint_txt, 'a') as out:
+        out.write(f'\\n--- {df} ---\\n')
+
+    if subprocess.run('command -v hadolint', shell=True, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        subprocess.run(f'hadolint "{df_abs}" 2>&1 | tee -a "{hadolint_txt}"', shell=True)
+        subprocess.run(
+            f'hadolint --format json "{df_abs}" > "{REPORTS_DIR}/hadolint-{safe}.json" 2>/dev/null',
+            shell=True)
+    else:
+        print('  [WARN] hadolint not found — using trivy config scan')
+        subprocess.run(
+            f'trivy config --severity CRITICAL,HIGH --format table "{df_abs}" '
+            f'2>/dev/null | tee -a "{hadolint_txt}"', shell=True)
+        subprocess.run(
+            f'trivy config --severity CRITICAL,HIGH --format json '
+            f'--output "{REPORTS_DIR}/trivy-dockerfile-{safe}.json" "{df_abs}" 2>/dev/null',
+            shell=True)
+
+print(f'\\n  === Hadolint summary ({len(all_dfs)} file(s) linted) ===')
+HADOLINT_EOF
+"""
                 }
             }
         }
@@ -1597,55 +1954,51 @@ fi
 
 // =============================================================================
 // Helper: Auto-detect project language
+// NOTE: The primary detection is now done via the Python module-discovery
+//       engine in Stage 1 (modules.json). This helper is kept as a
+//       last-resort fallback for any stage that calls it before modules.json
+//       is available (should not normally occur).
 // =============================================================================
 def detectLanguage() {
-    // --- Root-level fast-path checks ---
+    // Try modules.json first
+    def mf = "${WORKSPACE}/pipeline-reports/modules.json"
+    if (fileExists(mf)) {
+        def lang = sh(script: """
+python3 -c "
+import json, sys
+try:
+    m = json.load(open('${mf}'))
+    # prefer first non-root child module
+    for k,v in m.items():
+        if k != 'root':
+            print(v['language']); sys.exit(0)
+    if 'root' in m:
+        print(m['root']['language']); sys.exit(0)
+except: pass
+print('python')
+"
+        """, returnStdout: true).trim()
+        echo "Language from modules.json: ${lang}"
+        return lang
+    }
+
+    // Fallback: root-level file checks (original logic)
     if (fileExists('requirements.txt') || fileExists('setup.py') ||
         fileExists('pyproject.toml') || fileExists('Pipfile')) {
-        echo "Auto-detected: Python (root)"; return 'python'
+        return 'python'
     }
-    if (fileExists('pom.xml')) { echo "Auto-detected: Java (Maven)"; return 'java-maven' }
-    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
-        echo "Auto-detected: Java (Gradle)"; return 'java-gradle'
-    }
-    if (fileExists('angular.json')) { echo "Auto-detected: Angular"; return 'angular' }
+    if (fileExists('pom.xml')) return 'java-maven'
+    if (fileExists('build.gradle') || fileExists('build.gradle.kts')) return 'java-gradle'
+    if (fileExists('angular.json')) return 'angular'
     if (fileExists('package.json')) {
         def pkg = readFile('package.json')
-        if (pkg.contains('"react"')) { echo "Auto-detected: React"; return 'react' }
-        if (pkg.contains('"vue"'))   { echo "Auto-detected: Vue"; return 'vue' }
-        echo "Auto-detected: Node.js"; return 'nodejs'
+        if (pkg.contains('"react"')) return 'react'
+        if (pkg.contains('"vue"'))   return 'vue'
+        return 'nodejs'
     }
-    if (fileExists('go.mod')) { echo "Auto-detected: Go"; return 'go' }
-    if (sh(script: 'find . -maxdepth 2 -name "*.csproj" | head -1', returnStdout: true).trim()) {
-        echo "Auto-detected: .NET"; return 'dotnet'
+    if (fileExists('go.mod')) return 'go'
+    if (sh(script: 'find . -maxdepth 3 -name "*.csproj" 2>/dev/null | head -1', returnStdout: true).trim()) {
+        return 'dotnet'
     }
-
-    // --- Sub-directory detection (backend/, src/, app/, server/, api/) ---
-    def pyInSubdir = sh(script: """
-        find . -maxdepth 3 \\( -name 'requirements.txt' -o -name 'pyproject.toml' -o -name 'setup.py' -o -name 'Pipfile' \\) \\
-            ! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/pipeline-reports/*' 2>/dev/null | head -1
-    """, returnStdout: true).trim()
-    if (pyInSubdir) { echo "Auto-detected: Python (subdir: ${pyInSubdir})"; return 'python' }
-
-    def angularInSubdir = sh(script: "find . -maxdepth 3 -name 'angular.json' ! -path '*/node_modules/*' 2>/dev/null | head -1", returnStdout: true).trim()
-    if (angularInSubdir) { echo "Auto-detected: Angular (subdir: ${angularInSubdir})"; return 'angular' }
-
-    def pkgInSubdir = sh(script: "find . -maxdepth 3 -name 'package.json' ! -path '*/node_modules/*' ! -path '*/pipeline-reports/*' 2>/dev/null | head -1", returnStdout: true).trim()
-    if (pkgInSubdir) {
-        try {
-            def pkg = readFile(pkgInSubdir)
-            if (pkg.contains('"react"')) { echo "Auto-detected: React (subdir: ${pkgInSubdir})"; return 'react' }
-            if (pkg.contains('"vue"'))   { echo "Auto-detected: Vue (subdir: ${pkgInSubdir})"; return 'vue' }
-            echo "Auto-detected: Node.js (subdir: ${pkgInSubdir})"; return 'nodejs'
-        } catch(e) { /* ignore read errors */ }
-    }
-
-    def goInSubdir = sh(script: "find . -maxdepth 3 -name 'go.mod' ! -path '*/.git/*' 2>/dev/null | head -1", returnStdout: true).trim()
-    if (goInSubdir) { echo "Auto-detected: Go (subdir: ${goInSubdir})"; return 'go' }
-
-    def csprojInSubdir = sh(script: 'find . -maxdepth 4 -name "*.csproj" ! -path "*/obj/*" 2>/dev/null | head -1', returnStdout: true).trim()
-    if (csprojInSubdir) { echo "Auto-detected: .NET (subdir: ${csprojInSubdir})"; return 'dotnet' }
-
-    echo "Language detection: defaulting to python"
     return 'python'
 }
