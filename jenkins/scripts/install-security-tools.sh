@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install-security-tools.sh — Install All Security Tools for Jenkins Pipeline
+# install-security-tools.sh — Install ALL Tools for the Unified DevSecOps Agent
 # =============================================================================
-# Installs: Trivy, Grype, Hadolint, ShellCheck, Kubesec, OWASP Dependency-Check,
-#           SonarQube Scanner, and other utilities needed by the security pipeline.
+# Installs EVERYTHING on the Jenkins agent (server-side only).
+# No local/user machine dependencies are needed after running this script.
+#
+# Installs:
+#   Security:  Trivy, Grype, Hadolint, ShellCheck, Kubesec, OWASP DC
+#   Quality:   SonarQube Scanner CLI
+#   Python:    pytest, pytest-cov, pytest-html, flake8, bandit, pylint, mypy,
+#              black, safety, cyclonedx-bom, cyclonedx-py, pip-audit
+#   Node.js:   @cyclonedx/cyclonedx-npm (global)
+#   Go:        cyclonedx-gomod (global)
+#   Utilities: jq, git, python3, unzip, curl
 #
 # Run as root on RHEL 9 / CentOS 9 / Fedora
 # Usage: chmod +x install-security-tools.sh && sudo ./install-security-tools.sh
@@ -223,7 +232,9 @@ install_utilities() {
 
     # python3 (for report parsing)
     if ! command -v python3 &>/dev/null; then
-        dnf install -y python3 2>/dev/null || yum install -y python3 2>/dev/null || log_warn "python3 not available"
+        dnf install -y python3 python3-pip 2>/dev/null || \
+            yum install -y python3 python3-pip 2>/dev/null || \
+            log_warn "python3 not available"
     fi
 
     # git
@@ -231,7 +242,104 @@ install_utilities() {
         dnf install -y git 2>/dev/null || yum install -y git 2>/dev/null || log_warn "git not available"
     fi
 
+    # unzip (needed for SonarScanner and OWASP DC extraction)
+    if ! command -v unzip &>/dev/null; then
+        dnf install -y unzip 2>/dev/null || yum install -y unzip 2>/dev/null || log_warn "unzip not available"
+    fi
+
     log_info "Utilities check complete"
+}
+
+# =============================================================================
+# 9. Python Security & SBOM Tools (system-wide on agent)
+# =============================================================================
+install_python_tools() {
+    log_step "Installing Python security/SBOM tools (agent system-wide)"
+
+    if ! command -v python3 &>/dev/null; then
+        log_warn "python3 not found — skipping Python tool installation"
+        return 0
+    fi
+
+    # Upgrade pip first
+    pip install --break-system-packages --upgrade pip 2>/dev/null || \
+        pip install --upgrade pip 2>/dev/null || true
+
+    PYTHON_PACKAGES=(
+        # Test frameworks
+        "pytest"
+        "pytest-cov"
+        "pytest-html"
+        "pytest-xdist"
+        "pytest-json-report"
+        # Linting & formatting
+        "flake8"
+        "black"
+        "mypy"
+        "pylint"
+        # Security & audit
+        "bandit"
+        "safety"
+        # SBOM generation
+        "cyclonedx-bom"
+        "cyclonedx-py"
+        "pip-audit"
+        # Build tools
+        "build"
+        "wheel"
+        "setuptools"
+    )
+
+    pip install --break-system-packages --quiet "${PYTHON_PACKAGES[@]}" 2>/dev/null || \
+        pip install --quiet "${PYTHON_PACKAGES[@]}" 2>/dev/null || {
+            log_warn "Bulk pip install failed — trying one by one"
+            for pkg in "${PYTHON_PACKAGES[@]}"; do
+                pip install --break-system-packages --quiet "$pkg" 2>/dev/null || \
+                    pip install --quiet "$pkg" 2>/dev/null || \
+                    log_warn "Could not install $pkg (non-critical)"
+            done
+        }
+
+    log_info "Python tools installed:"
+    for tool in pytest flake8 bandit pylint black mypy pip-audit cyclonedx-py; do
+        if command -v "$tool" &>/dev/null || python3 -m "$tool" --version &>/dev/null 2>&1; then
+            log_info "  $tool: $(python3 -m $tool --version 2>&1 | head -1 || echo 'installed')"
+        else
+            log_warn "  $tool: not found"
+        fi
+    done
+}
+
+# =============================================================================
+# 10. Node.js Global SBOM Tool
+# =============================================================================
+install_nodejs_tools() {
+    log_step "Installing Node.js SBOM tools (global)"
+
+    if ! command -v npm &>/dev/null; then
+        log_warn "npm not found — skipping Node.js tool installation"
+        return 0
+    fi
+
+    npm install -g @cyclonedx/cyclonedx-npm 2>/dev/null && \
+        log_info "@cyclonedx/cyclonedx-npm installed globally" || \
+        log_warn "@cyclonedx/cyclonedx-npm installation failed (non-critical)"
+}
+
+# =============================================================================
+# 11. Go CycloneDX
+# =============================================================================
+install_go_tools() {
+    log_step "Installing Go SBOM tools"
+
+    if ! command -v go &>/dev/null; then
+        log_warn "go not found — skipping Go tool installation"
+        return 0
+    fi
+
+    go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest 2>/dev/null && \
+        log_info "cyclonedx-gomod installed" || \
+        log_warn "cyclonedx-gomod installation failed (non-critical)"
 }
 
 # =============================================================================
@@ -241,32 +349,49 @@ verify_all() {
     log_step "Verifying all tool installations"
 
     echo "=========================================="
-    echo "  Security Tools — Installation Summary"
+    echo "  Agent Tools — Installation Summary"
     echo "=========================================="
 
-    declare -A TOOLS=(
-        [trivy]="trivy --version 2>&1 | head -1"
-        [grype]="grype version 2>&1 | head -1"
-        [hadolint]="hadolint --version 2>&1"
-        [shellcheck]="shellcheck --version 2>&1 | grep version: | head -1"
-        [kubesec]="kubesec version 2>&1 | head -1"
-        [dependency-check]="/opt/dependency-check/bin/dependency-check.sh --version 2>&1 | head -1"
-        [sonar-scanner]="sonar-scanner --version 2>&1 | head -1"
-        [podman]="podman --version 2>&1"
-        [java]="java -version 2>&1 | head -1"
-        [jq]="jq --version 2>&1"
-        [python3]="python3 --version 2>&1"
-        [git]="git --version 2>&1"
-    )
-
-    for tool in "${!TOOLS[@]}"; do
-        if command -v "${tool}" &>/dev/null || [ -x "/opt/dependency-check/bin/dependency-check.sh" -a "${tool}" = "dependency-check" ]; then
-            VERSION=$(eval "${TOOLS[$tool]}" 2>/dev/null || echo "installed")
-            echo -e "  ${GREEN}✓${NC} ${tool}: ${VERSION}"
+    check_tool() {
+        local name="$1" cmd="$2" ver_cmd="${3:-$2 --version}"
+        if command -v "$cmd" &>/dev/null; then
+            VER=$(eval "$ver_cmd" 2>&1 | head -1 || echo "installed")
+            echo -e "  ${GREEN}✓${NC} ${name}: ${VER}"
         else
-            echo -e "  ${RED}✗${NC} ${tool}: NOT INSTALLED"
+            echo -e "  ${RED}✗${NC} ${name}: NOT INSTALLED"
+        fi
+    }
+
+    check_tool "trivy"             "trivy"            "trivy --version 2>&1 | head -1"
+    check_tool "grype"             "grype"            "grype version 2>&1 | head -1"
+    check_tool "hadolint"          "hadolint"         "hadolint --version 2>&1"
+    check_tool "shellcheck"        "shellcheck"       "shellcheck --version 2>&1 | grep version: | head -1"
+    check_tool "kubesec"           "kubesec"          "kubesec version 2>&1 | head -1"
+    check_tool "sonar-scanner"     "sonar-scanner"    "sonar-scanner --version 2>&1 | head -1"
+    check_tool "podman"            "podman"           "podman --version 2>&1"
+    check_tool "java"              "java"             "java -version 2>&1 | head -1"
+    check_tool "jq"                "jq"               "jq --version 2>&1"
+    check_tool "python3"           "python3"          "python3 --version 2>&1"
+    check_tool "pip"               "pip"              "pip --version 2>&1 | head -1"
+    check_tool "git"               "git"              "git --version 2>&1"
+    check_tool "npm"               "npm"              "npm --version 2>&1"
+    check_tool "go"                "go"               "go version 2>&1"
+
+    echo ""
+    echo "  Python security tools:"
+    for tool in pytest flake8 bandit pylint mypy black cyclonedx-py pip-audit; do
+        if command -v "$tool" &>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} ${tool}"
+        else
+            echo -e "  ${RED}✗${NC} ${tool}: not found"
         fi
     done
+
+    if [ -f "/opt/dependency-check/bin/dependency-check.sh" ]; then
+        echo -e "  ${GREEN}✓${NC} OWASP Dependency-Check: installed"
+    else
+        echo -e "  ${RED}✗${NC} OWASP Dependency-Check: NOT INSTALLED"
+    fi
 
     echo "=========================================="
 }
@@ -276,8 +401,9 @@ verify_all() {
 # =============================================================================
 main() {
     echo "=========================================="
-    echo "  Security Tools Installer"
-    echo "  Target: $(hostname) ($(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2))"
+    echo "  Unified DevSecOps Agent — Tool Installer"
+    echo "  Target: $(hostname) ($(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2 2>/dev/null || echo 'Linux'))"
+    echo "  All tools installed server-side (agent only)"
     echo "=========================================="
 
     install_trivy
@@ -288,11 +414,15 @@ main() {
     install_owasp_dc
     install_sonar_scanner
     install_utilities
+    install_python_tools
+    install_nodejs_tools
+    install_go_tools
     verify_all
 
     echo ""
-    log_info "All security tools installed successfully!"
-    log_info "You can now run the security pipeline."
+    log_info "All tools installed successfully on the agent!"
+    log_info "The unified DevSecOps pipeline is ready to run."
+    log_info "No local/user-machine dependencies are required."
 }
 
 main "$@"

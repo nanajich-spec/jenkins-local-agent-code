@@ -1,13 +1,19 @@
 # =============================================================================
-# pipeline.yaml — DevSecOps Pipeline Configuration
+# pipeline.yaml — Unified End-to-End DevSecOps Pipeline Configuration
 # =============================================================================
-# Configuration reference for the end-to-end DevSecOps pipeline.
-# Copy this to your project root and customize as needed.
+# Single pipeline handles everything end-to-end.
+# All tools are installed on the Jenkins agent (server-side); no local deps.
 # =============================================================================
 
 pipeline:
   name: devsecops-pipeline
-  description: "End-to-End DevSecOps Pipeline — Unit Testing, Docker Build, Security Scan, K8s Manifest Check, Final Report"
+  description: >
+    Unified End-to-End DevSecOps Pipeline — Bootstrap Agent Tools + Language
+    Detection + Dependencies + Lint + Unit Tests + SBOM + SonarQube + Build +
+    Docker (Makefile-first) + Trivy Image Scan + SAST + SCA + Dockerfile Lint +
+    ShellCheck + K8s Manifest Scan + Security Gate + Report.
+    Warnings emitted (not failures) for: missing tests, missing Dockerfile,
+    missing K8s manifests. All tools installed server-side by Stage 0.
 
 # =============================================================================
 # Jenkins Connection
@@ -36,26 +42,31 @@ registry:
 # Pipeline Stages Overview
 # =============================================================================
 #
-#  Stage                      Tool(s)                      Output Report
-#  ─────────────────────────  ───────────────────────────  ──────────────────────
-#  1. Checkout & Detect       git, file detection          -
-#  2. Verify Tools            all tools                    terminal output
-#  3. Install Dependencies    pip/npm/maven/go/dotnet      -
-#  4. Lint & Code Quality     flake8/eslint/pylint/bandit  flake8-report.txt, bandit-report.json
-#  5. Unit Testing            pytest/jest/go test/junit    pytest-results.xml, coverage.xml
-#  6. Integration Tests       pytest -m integration        pytest-integration-results.xml
-#  7. Build Application       make/python build/npm build  -
-#  8. Docker Image Build      podman/docker                -
-#  9. Docker Image Push       podman/docker push           -
-# 10. Trivy Image Scan        trivy image                  trivy-image-scan.json
-# 11. SAST & Secret Detection trivy fs (vuln,misconfig)    trivy-fs-scan.json, secret-scan.json
-# 12. SCA — Dependency Scan   trivy fs, OWASP DC, grype   trivy-sca.json, grype-sca.json
-# 13. Dockerfile Lint         hadolint                     hadolint.json
-# 14. ShellCheck              shellcheck                   shellcheck.json
-# 15. K8s Manifest Scan       trivy config, kubesec        trivy-k8s-config.json, kubesec-results.json
-# 16. Security Gate           aggregation                  gate-results.txt
-# 17. Deploy to K8s           kubectl                      -
-# 18. Final Report            python3 (parser)             TERMINAL OUTPUT
+#  Stage                       Tool(s)                          Output / Notes
+#  ──────────────────────────  ─────────────────────────────── ────────────────────────────────
+#  0. Bootstrap Agent          pip/npm/go install (server-side) ALL tools pre-installed on agent
+#  1. Checkout & Detect        git, file detection              pipeline-warnings.txt
+#  2. Install Project Deps     pip/npm/maven/gradle/go/dotnet   -
+#  3. Lint & Code Quality      flake8/pylint/bandit/eslint      flake8-report.txt, bandit-report.json
+#  4. Unit Testing + Coverage  pytest/jest/go test/junit        pytest-results.xml, coverage.xml
+#                              ⚠ WARNING if tests folder missing
+#  5. Integration Tests        pytest -m integration/jest       pytest-integration-results.xml
+#  6. CycloneDX SBOM           cyclonedx-py/npm/gomod/trivy     sbom/sbom-*.json (JSON + SPDX)
+#  7. SonarQube Analysis       sonar-scanner                    sonarqube/quality-gate-status.json
+#  8. Build Application        make/python/mvn/npm/go           -
+#  9. Docker Build & Push      make docker-build / podman/docker ⚠ WARNING if no Dockerfile+Makefile
+# 10. Trivy Image Scan         trivy image                      trivy/trivy-image-scan.json
+#                              + SBOM of image                  sbom/sbom-trivy-image.json
+# 11. SAST & Secret Detection  trivy fs (vuln,misconfig,secret) trivy/trivy-fs-scan.json, secret-scan.json
+# 12. SCA — Dep Scan           trivy fs (vuln,license), grype   trivy/trivy-sca.json, grype-sca.json
+# 13. Dockerfile Lint          hadolint (fallback: trivy config) hadolint.json
+#                              ⚠ WARNING if no Dockerfile
+# 14. ShellCheck               shellcheck                       shellcheck.json
+# 15. K8s Manifest Scan        trivy config, kubesec            trivy/trivy-k8s-config.json
+#                              ⚠ WARNING if no K8s manifests
+# 16. Security Gate            aggregation (all trivy reports)  gate-results.txt
+# 17. Deploy to K8s            kubectl                          -   (optional)
+# 18. Comprehensive Report     generate-comprehensive-report.sh comprehensive-report.html/txt/json
 #
 
 # =============================================================================
@@ -120,14 +131,27 @@ security:
     fail_on_secrets: true
 
 # =============================================================================
-# Docker Configuration
+# Docker Configuration (Makefile-first)
 # =============================================================================
+# Build priority:
+#   1. If Makefile has docker-build / build-image / image / docker / container
+#      target → use `make <target>`
+#   2. If Dockerfile or Containerfile exists → use podman / docker
+#   3. If neither → ⚠ WARNING emitted, build skipped (not a failure)
+#
 docker:
-  image_name: ""
+  image_name: ""          # Set IMAGE_NAME param to enable Docker build
   image_tag: "latest"
   dockerfile: "Dockerfile"
   registry: "132.186.17.22:5000"
-  build_via_makefile: true    # Try `make docker-build` if Makefile exists
+  build_via_makefile: true    # Prefer Makefile target if available
+  makefile_targets:           # Checked in order; first match wins
+    - docker-build
+    - build-image
+    - image
+    - docker
+    - container
+    - build
 
 # =============================================================================
 # Kubernetes Deployment
@@ -151,7 +175,22 @@ defaults:
   run_dockerfile_lint: true
   run_owasp_check: false
   run_grype: false
-  run_sonarqube: false
+  generate_sbom: true
+  run_sonarqube: true
   fail_on_critical: true
   deploy_to_k8s: false
-  timeout_minutes: 90
+  timeout_minutes: 120
+  force_tool_reinstall: false
+
+# =============================================================================
+# Agent-Side Tool Installation (Stage 0)
+# =============================================================================
+# All tools are installed ON THE AGENT (server-side) in Stage 0.
+# No local/user-machine packages are ever needed.
+# Tool install script: jenkins/scripts/install-security-tools.sh
+# Tools installed:
+#   - trivy, grype, hadolint, shellcheck, kubesec, sonar-scanner, OWASP DC
+#   - Python: pytest, flake8, bandit, pylint, mypy, black, cyclonedx-py, pip-audit
+#   - Node.js: @cyclonedx/cyclonedx-npm (global)
+#   - Go: cyclonedx-gomod (global)
+#   - Utilities: jq, git, python3, unzip, curl

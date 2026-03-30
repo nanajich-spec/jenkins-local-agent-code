@@ -764,7 +764,7 @@ else:
         // Stage 9: Docker Build & Push
         // =====================================================================
         stage('Docker Build & Push') {
-            when { expression { params.IMAGE_NAME?.trim() } }
+            when { expression { params.IMAGE_NAME?.trim() && params.IMAGE_NAME?.trim() != 'none' } }
             steps {
                 script {
                     def fullImage = "${REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
@@ -772,6 +772,12 @@ else:
 
                     sh """
                         echo "=== Building Container Image: ${fullImage} ==="
+
+                        # Verify Dockerfile exists before attempting build
+                        if [ ! -f "${dfPath}" ]; then
+                            echo "WARNING: Dockerfile not found at '${dfPath}' — skipping Docker build"
+                            exit 0
+                        fi
 
                         # Use podman (available on RHEL9)
                         if command -v podman &>/dev/null; then
