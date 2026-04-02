@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: catool-ui
-  labels:
-    name: catool-ui
