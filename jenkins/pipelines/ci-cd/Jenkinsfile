@@ -57,6 +57,8 @@ pipeline {
         // Agent
         string(name: 'AGENT_LABEL',               defaultValue: 'local-security-agent', description: 'Jenkins agent label')
         string(name: 'TIMEOUT_MINUTES',            defaultValue: '60',   description: 'Pipeline timeout (minutes)')
+        string(name: 'SCAN_ID',                    defaultValue: '',     description: 'Unique scan identifier')
+        string(name: 'SOURCE_UPLOAD_PATH',         defaultValue: '',     description: 'Path to uploaded source on server')
     }
 
     stages {
@@ -67,8 +69,18 @@ pipeline {
         stage('Checkout & Detect') {
             steps {
                 script {
-                    // Checkout if Git repo provided
-                    if (params.GIT_REPO?.trim()) {
+                    // Extract uploaded source or checkout from Git
+                    if (params.SOURCE_UPLOAD_PATH?.trim()) {
+                        def uploadPath = params.SOURCE_UPLOAD_PATH.trim()
+                        def tarFile = uploadPath + '/source.tar.gz'
+                        sh """
+                            if [ -f '${tarFile}' ]; then
+                                echo "=== Extracting uploaded source code ==="
+                                tar xzf '${tarFile}' -C '${WORKSPACE}' 2>/dev/null || true
+                                echo "Extracted: \$(find '${WORKSPACE}' -maxdepth 3 -type f | wc -l) files"
+                            fi
+                        """
+                    } else if (params.GIT_REPO?.trim()) {
                         checkout([
                             $class: 'GitSCM',
                             branches: [[name: "*/${params.GIT_BRANCH}"]],
@@ -976,6 +988,21 @@ print(count)
                 reportFiles: '*.html',
                 reportName: 'Build & Test Reports'
             ])
+
+            // Copy reports to /opt/scan-reports/<scan_id> for API access
+            script {
+                def scanId = params.SCAN_ID ?: ''
+                if (scanId) {
+                    sh """
+                        DEST="/opt/scan-reports/${scanId}"
+                        mkdir -p "\${DEST}"
+                        for f in '${REPORTS_DIR}'/*.json '${REPORTS_DIR}'/*.txt '${REPORTS_DIR}'/*.html; do
+                            [ -f "\$f" ] && cp "\$f" "\${DEST}/" 2>/dev/null || true
+                        done
+                        echo "CI/CD reports copied to \${DEST}"
+                    """
+                }
+            }
 
             echo """
             ==========================================

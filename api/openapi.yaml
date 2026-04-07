@@ -1,0 +1,979 @@
+openapi: "3.1.0"
+
+info:
+  title: DevSecOps Security Scan API
+  version: "2.0.0"
+  description: |
+    ## Overview
+    Full end-to-end REST API for the Jenkins-backed DevSecOps security scanning
+    platform.  The API covers four functional domains:
+
+    | Domain | Prefix | Description |
+    |--------|--------|-------------|
+    | **Scan** | `/scan` | Submit source code, track scan jobs, fetch results |
+    | **Agent** | `/agent` | Provision / destroy dynamic Jenkins JNLP agents |
+    | **Pipeline** | `/pipeline` | Trigger / query Jenkins pipeline executions |
+    | **Reports** | `/reports` | Download generated security artifacts & SBOM |
+
+    ### How it fits together
+    ```
+    Developer  ──POST /scan/upload──▶  API
+                                        │
+                                        ├─POST /agent/create────▶  Jenkins (dynamic JNLP)
+                                        ├─POST /pipeline/trigger─▶  Jenkins Job
+                                        ├─GET  /scan/{id}/status ─▶  poll build
+                                        └─GET  /reports/{id}/...──▶  download artifacts
+    ```
+  contact:
+    name: DevSecOps Platform Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://132.186.17.22:9091
+    description: Agent-host scan server (production)
+  - url: http://localhost:9091
+    description: Local development server
+
+tags:
+  - name: scan
+    description: Submit and monitor security scans
+  - name: agent
+    description: Dynamic Jenkins JNLP agent lifecycle
+  - name: pipeline
+    description: Jenkins pipeline trigger & status
+  - name: reports
+    description: Download scan reports and SBOM artifacts
+  - name: health
+    description: Service health & readiness probes
+
+# ─────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────
+paths:
+
+  # ── Health ────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [health]
+      operationId: health_check
+      summary: Liveness probe
+      description: Returns 200 if the API server is alive.
+      responses:
+        "200":
+          description: Server is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                timestamp: "2026-04-07T07:04:51Z"
+                version: "2.0.0"
+
+  /health/ready:
+    get:
+      tags: [health]
+      operationId: readiness_check
+      summary: Readiness probe
+      description: |
+        Checks that all downstream dependencies (Jenkins, SonarQube, registry)
+        are reachable before declaring the API ready.
+      responses:
+        "200":
+          description: All dependencies reachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+        "503":
+          description: One or more dependencies unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+
+  # ── Scan client bootstrap ──────────────────────────────────
+  /scan:
+    get:
+      tags: [scan]
+      operationId: get_scan_client
+      summary: Download scan client shell script
+      description: |
+        Serves the `security-scan-client.sh` bootstrap script.
+        Pipe directly to bash:
+        ```
+        curl -sL http://132.186.17.22:9091/scan | bash
+        ```
+      responses:
+        "200":
+          description: Shell script content
+          content:
+            text/plain:
+              schema:
+                type: string
+                format: binary
+
+  # ── Source upload ──────────────────────────────────────────
+  /scan/upload:
+    post:
+      tags: [scan]
+      operationId: upload_source
+      summary: Upload source code archive
+      description: |
+        Accepts a gzipped tar archive of the project to scan.  
+        The server stores it under `/opt/scan-uploads/<scan_id>/source.tar.gz`.  
+        Maximum upload size: **1 GB**.
+      parameters:
+        - name: X-Scan-ID
+          in: header
+          required: true
+          description: Unique scan identifier (e.g. `alice-laptop-1744000000`)
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9_\-]{3,80}$'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: gzip-compressed tar archive of source tree
+      responses:
+        "200":
+          description: Upload accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadResponse"
+              example:
+                status: ok
+                scan_id: alice-laptop-1744000000
+                upload_path: /opt/scan-uploads/alice-laptop-1744000000
+                size: 2097152
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          description: Payload too large (> 1 GB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Scan status & results ──────────────────────────────────
+  /scan/{scan_id}/status:
+    get:
+      tags: [scan]
+      operationId: get_scan_status
+      summary: Poll scan / build status
+      description: |
+        Returns the current Jenkins build status for the given scan ID.
+        Clients should poll every 5–10 seconds until `result` is one of
+        `SUCCESS`, `FAILURE`, or `ABORTED`.
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Current build status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanStatusResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /scan/{scan_id}/cancel:
+    post:
+      tags: [scan]
+      operationId: cancel_scan
+      summary: Abort a running scan
+      description: Sends a stop signal to the Jenkins build associated with the scan.
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Cancellation requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleOkResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /scan/{scan_id}/logs:
+    get:
+      tags: [scan]
+      operationId: stream_scan_logs
+      summary: Stream console log
+      description: |
+        Returns the full Jenkins console output captured so far.  
+        Set `?start=<offset>` to paginate / tail the log.
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: start
+          in: query
+          required: false
+          description: Byte offset to resume from (for incremental polling)
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Console log text
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Cleanup ────────────────────────────────────────────────
+  /scan/cleanup:
+    post:
+      tags: [scan]
+      operationId: cleanup_scan
+      summary: Remove uploaded source files
+      description: |
+        Deletes the uploaded tar archive and any temporary workspace files for
+        the given scan ID. Called automatically by the client after the scan
+        finishes, but can also be triggered manually.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanIdBody"
+      responses:
+        "200":
+          description: Files removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleOkResponse"
+              example:
+                status: cleaned
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Agent lifecycle ────────────────────────────────────────
+  /agent/create:
+    post:
+      tags: [agent]
+      operationId: create_agent
+      summary: Provision a dynamic Jenkins JNLP agent
+      description: |
+        Calls `dynamic-agent-manager.sh create <scan_id>` which:
+        1. Checks the concurrency limit (max 10 simultaneous agents).
+        2. Creates workspace `/opt/jenkins-agent/dynamic/scan-agent-<id>/`.
+        3. Registers a `DumbSlave` in Jenkins via the Groovy scripting API.
+        4. Retrieves the JNLP secret and launches `agent.jar`.
+        5. Polls `/api/json` until the agent is online (≤ 30 s).
+
+        On failure the caller should fall back to the shared static agent
+        `local-security-agent`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentCreateRequest"
+      responses:
+        "200":
+          description: Agent online
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentCreateResponse"
+              example:
+                status: ok
+                agent_name: scan-agent-1744000000
+                agent_label: scan-agent-1744000000
+                scan_id: alice-laptop-1744000000
+                output: "Agent scan-agent-1744000000 is now online"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          description: Concurrency limit reached (max 10 dynamic agents)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Agent creation timed out (120 s)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /agent/destroy:
+    post:
+      tags: [agent]
+      operationId: destroy_agent
+      summary: Destroy a dynamic Jenkins agent
+      description: |
+        Calls `dynamic-agent-manager.sh destroy <scan_id>` which:
+        1. Kills the JNLP `agent.jar` process.
+        2. Deletes the Jenkins node via `POST /computer/<name>/doDelete`.
+        3. Removes the local workspace directory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanIdBody"
+      responses:
+        "200":
+          description: Agent destroyed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentDestroyResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /agent/status:
+    post:
+      tags: [agent]
+      operationId: get_agent_status
+      summary: Query dynamic agent status
+      description: |
+        If `scan_id` is provided, returns the status of that specific agent.
+        If omitted, returns a list of all currently registered dynamic agents.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanIdBodyOptional"
+      responses:
+        "200":
+          description: Agent status or list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentStatusResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /agent/list:
+    get:
+      tags: [agent]
+      operationId: list_agents
+      summary: List all active dynamic agents
+      description: Returns all currently active scan agents and their states.
+      responses:
+        "200":
+          description: Agent list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentListResponse"
+
+  # ── Pipeline trigger & status ──────────────────────────────
+  /pipeline/trigger:
+    post:
+      tags: [pipeline]
+      operationId: trigger_pipeline
+      summary: Trigger a Jenkins pipeline build
+      description: |
+        Calls Jenkins `POST /job/<pipeline>/buildWithParameters` and returns
+        the resulting queue item URL for tracking.
+
+        **Supported pipelines:**
+        | Name | Stages | SBOM |
+        |------|--------|------|
+        | `security-scan-pipeline` | 11 stages | Trivy CycloneDX + SPDX |
+        | `devsecops-pipeline` | 19 stages | Multi-lang + Trivy |
+        | `ci-cd-pipeline` | 13 stages | — |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PipelineTriggerRequest"
+      responses:
+        "202":
+          description: Build queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineTriggerResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /pipeline/{pipeline_name}/builds:
+    get:
+      tags: [pipeline]
+      operationId: list_pipeline_builds
+      summary: List recent builds of a pipeline
+      parameters:
+        - name: pipeline_name
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [security-scan-pipeline, devsecops-pipeline, ci-cd-pipeline]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+      responses:
+        "200":
+          description: Build list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildListResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /pipeline/{pipeline_name}/builds/{build_number}:
+    get:
+      tags: [pipeline]
+      operationId: get_build_detail
+      summary: Get single build detail
+      parameters:
+        - name: pipeline_name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: build_number
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Build detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Reports ────────────────────────────────────────────────
+  /reports/{scan_id}:
+    get:
+      tags: [reports]
+      operationId: list_report_files
+      summary: List available report artifacts for a scan
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: List of artifact file paths
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportListResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /reports/{scan_id}/summary:
+    get:
+      tags: [reports]
+      operationId: get_scan_summary
+      summary: Get structured vulnerability summary
+      description: |
+        Returns a parsed JSON summary of all scan findings including:
+        - Critical / High / Medium / Low counts by scan type
+        - SBOM component count
+        - Quality gate result
+        - Secrets detected
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Vulnerability summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanSummary"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /reports/{scan_id}/download:
+    get:
+      tags: [reports]
+      operationId: download_reports_archive
+      summary: Download all reports as a tar.gz archive
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Reports archive
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /reports/{scan_id}/{artifact}:
+    get:
+      tags: [reports]
+      operationId: get_report_artifact
+      summary: Download a specific report artifact
+      description: |
+        Fetch a specific file from the scan results, e.g.:
+        - `secret-scan.json`
+        - `trivy-fs-scan.json`
+        - `sbom/trivy-cyclonedx-full.json`
+        - `sbom/trivy-spdx-sbom.json`
+        - `shellcheck.json`
+        - `sonarqube-analysis.txt`
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: artifact
+          in: path
+          required: true
+          schema:
+            type: string
+          examples:
+            secret:
+              value: secret-scan.json
+            trivy_fs:
+              value: trivy-fs-scan.json
+            sbom_cyclonedx:
+              value: sbom/trivy-cyclonedx-full.json
+      responses:
+        "200":
+          description: Artifact content
+          content:
+            application/json:
+              schema: {}
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+# ─────────────────────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────────────────────
+components:
+
+  # ── Parameters ──────────────────────────────────────────────
+  parameters:
+    ScanId:
+      name: scan_id
+      in: path
+      required: true
+      description: Unique scan identifier (e.g. `alice-laptop-1744000000`)
+      schema:
+        type: string
+        pattern: '^[a-zA-Z0-9_\-]{3,80}$'
+
+  # ── Responses ───────────────────────────────────────────────
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal server or downstream error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  # ── Schemas ─────────────────────────────────────────────────
+  schemas:
+
+    # Generic ──────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+        detail:
+          type: string
+          description: Optional additional context
+
+    SimpleOkResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, cleaned, cancelled]
+
+    ScanIdBody:
+      type: object
+      required: [scan_id]
+      properties:
+        scan_id:
+          type: string
+          pattern: '^[a-zA-Z0-9_\-]{3,80}$'
+
+    ScanIdBodyOptional:
+      type: object
+      properties:
+        scan_id:
+          type: string
+          pattern: '^[a-zA-Z0-9_\-]{3,80}$'
+
+    # Health ───────────────────────────────────────────────────
+    HealthResponse:
+      type: object
+      required: [status, timestamp, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        timestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+
+    ReadinessResponse:
+      type: object
+      required: [ready, checks]
+      properties:
+        ready:
+          type: boolean
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              ok:
+                type: boolean
+              latency_ms:
+                type: number
+              error:
+                type: string
+
+    # Scan ─────────────────────────────────────────────────────
+    UploadResponse:
+      type: object
+      required: [status, scan_id, upload_path, size]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        scan_id:
+          type: string
+        upload_path:
+          type: string
+        size:
+          type: integer
+          description: File size in bytes
+
+    ScanStatusResponse:
+      type: object
+      required: [scan_id, building, result]
+      properties:
+        scan_id:
+          type: string
+        building:
+          type: boolean
+          description: True while the Jenkins build is still running
+        result:
+          type: string
+          nullable: true
+          enum: [SUCCESS, FAILURE, ABORTED, UNSTABLE, null]
+          description: null while building
+        build_number:
+          type: integer
+          nullable: true
+        build_url:
+          type: string
+          format: uri
+          nullable: true
+        duration_ms:
+          type: integer
+          nullable: true
+        estimated_duration_ms:
+          type: integer
+          nullable: true
+        timestamp:
+          type: integer
+          description: Unix epoch millis of build start
+
+    ReportListResponse:
+      type: object
+      required: [scan_id, artifacts]
+      properties:
+        scan_id:
+          type: string
+        artifacts:
+          type: array
+          items:
+            type: string
+          example:
+            - secret-scan.json
+            - trivy-fs-scan.json
+            - trivy-sca.json
+            - sbom/trivy-cyclonedx-full.json
+            - sbom/trivy-spdx-sbom.json
+            - shellcheck.json
+            - sonarqube-analysis.txt
+            - sonarqube-quality-gate.json
+
+    ScanSummary:
+      type: object
+      required: [scan_id, gate_passed, totals]
+      properties:
+        scan_id:
+          type: string
+        gate_passed:
+          type: boolean
+        totals:
+          $ref: "#/components/schemas/FindingTotals"
+        findings_by_type:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FindingTotals"
+        sbom_component_count:
+          type: integer
+          nullable: true
+        secrets_found:
+          type: integer
+          nullable: true
+        sonarqube_quality_gate:
+          type: string
+          nullable: true
+          enum: [OK, WARN, ERROR, null]
+        pipeline:
+          type: string
+          nullable: true
+        build_number:
+          type: integer
+          nullable: true
+
+    FindingTotals:
+      type: object
+      properties:
+        critical:
+          type: integer
+          default: 0
+        high:
+          type: integer
+          default: 0
+        medium:
+          type: integer
+          default: 0
+        low:
+          type: integer
+          default: 0
+        unknown:
+          type: integer
+          default: 0
+
+    # Agent ────────────────────────────────────────────────────
+    AgentCreateRequest:
+      type: object
+      required: [scan_id]
+      properties:
+        scan_id:
+          type: string
+          pattern: '^[a-zA-Z0-9_\-]{3,80}$'
+          description: Unique scan ID; becomes part of the agent name
+
+    AgentCreateResponse:
+      type: object
+      required: [status, agent_name, agent_label, scan_id]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        agent_name:
+          type: string
+          description: Jenkins node name, e.g. `scan-agent-1744000000`
+        agent_label:
+          type: string
+          description: JNLP label used in `agent { label "..." }`
+        scan_id:
+          type: string
+        output:
+          type: string
+          description: Last 500 chars of agent creation script stdout
+
+    AgentDestroyResponse:
+      type: object
+      required: [status, scan_id]
+      properties:
+        status:
+          type: string
+          enum: [destroyed]
+        scan_id:
+          type: string
+        output:
+          type: string
+
+    AgentStatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        output:
+          type: string
+          description: Raw stdout from dynamic-agent-manager.sh status/list
+
+    AgentListResponse:
+      type: object
+      required: [agents]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentEntry"
+
+    AgentEntry:
+      type: object
+      properties:
+        name:
+          type: string
+        scan_id:
+          type: string
+        online:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    # Pipeline ─────────────────────────────────────────────────
+    PipelineTriggerRequest:
+      type: object
+      required: [pipeline, agent_label, scan_id]
+      properties:
+        pipeline:
+          type: string
+          enum: [security-scan-pipeline, devsecops-pipeline, ci-cd-pipeline]
+          description: Which Jenkins pipeline to trigger
+        agent_label:
+          type: string
+          description: >
+            Target Jenkins agent label — dynamic (`scan-agent-<id>`) or
+            static (`local-security-agent`)
+        scan_id:
+          type: string
+        scan_type:
+          type: string
+          enum: [code-only, image-only, full]
+          default: code-only
+        source_upload_path:
+          type: string
+          description: Absolute path on agent host where tar.gz was stored
+          nullable: true
+        image_name:
+          type: string
+          nullable: true
+        image_tag:
+          type: string
+          default: latest
+          nullable: true
+        generate_sbom:
+          type: boolean
+          default: true
+        fail_on_critical:
+          type: boolean
+          default: true
+        registry_url:
+          type: string
+          nullable: true
+        scan_registry_images:
+          type: boolean
+          default: false
+
+    PipelineTriggerResponse:
+      type: object
+      required: [status, queue_item_url]
+      properties:
+        status:
+          type: string
+          enum: [queued]
+        queue_item_url:
+          type: string
+          format: uri
+        build_number:
+          type: integer
+          nullable: true
+          description: Populated once the build leaves the queue
+
+    BuildListResponse:
+      type: object
+      required: [pipeline, builds]
+      properties:
+        pipeline:
+          type: string
+        builds:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildSummary"
+
+    BuildSummary:
+      type: object
+      properties:
+        number:
+          type: integer
+        result:
+          type: string
+          nullable: true
+        building:
+          type: boolean
+        timestamp:
+          type: integer
+        duration:
+          type: integer
+        url:
+          type: string
+          format: uri
+
+    BuildDetail:
+      allOf:
+        - $ref: "#/components/schemas/BuildSummary"
+        - type: object
+          properties:
+            display_name:
+              type: string
+            description:
+              type: string
+              nullable: true
+            parameters:
+              type: object
+              additionalProperties: {}
+            artifacts:
+              type: array
+              items:
+                type: object
+                properties:
+                  fileName:
+                    type: string
+                  relativePath:
+                    type: string
+                  displayPath:
+                    type: string

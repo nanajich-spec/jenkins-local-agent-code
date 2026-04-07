@@ -1051,6 +1051,29 @@ with open(json_path, "w") as f:
         "top_issues": all_critical_issues[:50]
     }, f, indent=2, default=str)
 
+# Also write scan-summary.json for the API report parser
+scan_id = os.environ.get("SCAN_ID", "")
+if scan_id:
+    scan_summary = {
+        "scan_id": scan_id,
+        "scan_type": "devsecops",
+        "timestamp": TIMESTAMP,
+        "gate_status": "PASS" if overall_status == "PASS" else "FAIL",
+        "gate_passed": overall_status == "PASS",
+        "totals": {
+            "critical": summary_counts["critical_vulns"] + summary_counts["misconfigs_critical"],
+            "high": summary_counts["high_vulns"] + summary_counts["misconfigs_high"],
+            "medium": summary_counts["medium_vulns"],
+            "low": summary_counts["low_vulns"],
+            "unknown": 0
+        },
+        "secrets_found": summary_counts["secrets"],
+        "sbom_component_count": summary_counts["sbom_components"] or None,
+        "sonarqube_quality_gate": summary_counts["sonar_gate"] if summary_counts["sonar_gate"] != "N/A" else None,
+    }
+    with open(os.path.join(REPORTS_DIR, "scan-summary.json"), "w") as f:
+        json.dump(scan_summary, f, indent=2)
+
 # Print text report to console
 print(text_report)
 

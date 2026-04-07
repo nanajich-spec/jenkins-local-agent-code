@@ -556,15 +556,23 @@ upload_source() {
 
     # Upload to central server
     step "Uploading source code to scan server..."
-    log_detail "Upload target: ${UPLOAD_SERVER}/upload"
+    log_detail "Upload target: ${UPLOAD_SERVER}/scan/upload"
     log_detail "Scan ID header: ${SCAN_ID}"
     spin "Uploading ${tar_size} to scan server..."
     local upload_response
     upload_response=$(curl -s --connect-timeout 30 --max-time 300 \
-        -X POST "${UPLOAD_SERVER}/upload" \
+        -X POST "${UPLOAD_SERVER}/scan/upload" \
         -H "Content-Type: application/octet-stream" \
         -H "X-Scan-ID: ${SCAN_ID}" \
         --data-binary "@${tar_file}" 2>/dev/null || echo '{"error":"upload failed"}')
+    # Fallback to legacy /upload endpoint if /scan/upload fails
+    if echo "${upload_response}" | grep -q '"error"'; then
+        upload_response=$(curl -s --connect-timeout 30 --max-time 300 \
+            -X POST "${UPLOAD_SERVER}/upload" \
+            -H "Content-Type: application/octet-stream" \
+            -H "X-Scan-ID: ${SCAN_ID}" \
+            --data-binary "@${tar_file}" 2>/dev/null || echo '{"error":"upload failed"}')
+    fi
     log_detail "Server response: ${upload_response}"
 
     rm -f "${tar_file}"
@@ -1090,6 +1098,31 @@ except: pass
     cat "${OUTPUT_DIR}"/*/full-console-log.txt > "${OUTPUT_DIR}/full-console-log.txt" 2>/dev/null || true
     spin_done "Combined console log saved"
 
+    # ── Download structured report summary from API ──
+    step "Downloading structured report summary..."
+    for current_scanid in "${TRIGGERED_SCANIDS[@]}"; do
+        local summary_resp
+        summary_resp=$(curl -s --connect-timeout 10 --max-time 30 \
+            "${UPLOAD_SERVER}/reports/${current_scanid}/summary" 2>/dev/null || echo "")
+        if [ -n "${summary_resp}" ] && echo "${summary_resp}" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+            echo "${summary_resp}" | python3 -m json.tool > "${OUTPUT_DIR}/${current_scanid##*-}-scan-summary.json" 2>/dev/null || true
+            spin_done "Summary downloaded for ${current_scanid##*-}"
+        fi
+    done
+
+    # Try to download the HTML report via API
+    for current_scanid in "${TRIGGERED_SCANIDS[@]}"; do
+        local html_resp
+        html_resp=$(curl -s --connect-timeout 10 --max-time 30 \
+            "${UPLOAD_SERVER}/reports/${current_scanid}/security-report.html" 2>/dev/null || echo "")
+        if [ -n "${html_resp}" ] && echo "${html_resp}" | head -5 | grep -q "html"; then
+            local report_dir="${OUTPUT_DIR}/${current_scanid##*-}"
+            [ -d "${report_dir}" ] || report_dir="${OUTPUT_DIR}"
+            echo "${html_resp}" > "${report_dir}/security-report.html" 2>/dev/null || true
+            spin_done "HTML report downloaded for ${current_scanid##*-}"
+        fi
+    done
+
     # ══════════════════════════════════════════════════════════════
     # FINAL COMBINED SUMMARY
     # ══════════════════════════════════════════════════════════════
@@ -1177,6 +1210,15 @@ main() {
 
     # Cleanup: destroy dynamic agent (Jenkinsfile post{} also does this as backup)
     destroy_dynamic_agent
+
+    # Cleanup uploaded source via API
+    if [ -n "${SOURCE_UPLOAD_PATH}" ]; then
+        log_detail "Requesting source cleanup..."
+        curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "${UPLOAD_SERVER}/scan/cleanup" \
+            -H "Content-Type: application/json" \
+            -d "{\"scan_id\": \"${SCAN_ID}\"}" 2>/dev/null || true
+    fi
 }
 
 main

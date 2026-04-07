@@ -1,0 +1,24 @@
+# DevSecOps Security Scan API — Python dependencies
+# Install: pip install -r api/requirements.txt
+
+# ── Core framework ────────────────────────────────────────────
+fastapi>=0.100.0
+uvicorn[standard]>=0.24.0
+
+# ── Pydantic v2 ───────────────────────────────────────────────
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# ── HTTP client (async) ───────────────────────────────────────
+httpx>=0.25.0
+
+# ── YAML (for serving openapi.yaml) ──────────────────────────
+PyYAML>=6.0
+
+# ── OpenAPI spec validation ───────────────────────────────────
+openapi-spec-validator>=0.7.0
+
+# ── Dev / testing ─────────────────────────────────────────────
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0      # also used as test client

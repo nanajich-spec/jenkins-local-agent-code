@@ -37,9 +37,9 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 PIPELINE_JOBS = [
     {
         "name": "security-scan-pipeline",
-        "config": os.path.join(script_dir, "..", "config", "pipeline-job-config.xml"),
-        "type": "xml",
-        "description": "Security scans (Trivy, SAST, SCA, secrets)",
+        "config": os.path.join(script_dir, "..", "pipelines", "security-scan-pipeline.groovy"),
+        "type": "jenkinsfile",
+        "description": "End-to-End Security Scanning Pipeline (Trivy, SAST, SCA, secrets, SBOM, SonarQube)",
     },
     {
         "name": "ci-cd-pipeline",
