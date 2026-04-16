@@ -197,6 +197,13 @@ def build_summary(scan_id: str) -> Optional[ScanSummary]:
         if data and isinstance(data, dict):
             return _build_from_summary_json(scan_id, data)
 
+    # Check if we have a unified local final-report.json (pre-push scanner)
+    unified_report = root / "final-report.json"
+    if unified_report.is_file():
+        data = _load_json(unified_report)
+        if data and isinstance(data, dict):
+            return _build_from_unified_report(scan_id, data)
+
     findings_by_type: Dict[str, FindingTotals] = {}
 
     # ── SAST / filesystem scan ──────────────────────────────
@@ -366,4 +373,47 @@ def _build_from_summary_json(
         sbom_component_count=data.get("sbom_component_count"),
         secrets_found=data.get("secrets_found", 0),
         sonarqube_quality_gate=data.get("sonarqube_quality_gate"),
+    )
+
+
+def _build_from_unified_report(scan_id: str, data: Dict[str, Any]) -> ScanSummary:
+    """Build ScanSummary from unified local final-report.json output."""
+    summary = data.get("summary") or {}
+    verdict = summary.get("gate_verdict") or {}
+    sev = summary.get("severity_totals") or {}
+
+    totals = FindingTotals(
+        critical=int(sev.get("CRITICAL", 0)),
+        high=int(sev.get("HIGH", 0)),
+        medium=int(sev.get("MEDIUM", 0)),
+        low=int(sev.get("LOW", 0)),
+        unknown=int(sev.get("UNKNOWN", 0)),
+    )
+
+    findings_by_type: Dict[str, FindingTotals] = {}
+    for key, val in (data.get("findings_by_tool") or {}).items():
+        if isinstance(val, dict):
+            findings_by_type[key] = FindingTotals(
+                critical=int(val.get("CRITICAL", 0)),
+                high=int(val.get("HIGH", 0)),
+                medium=int(val.get("MEDIUM", 0)),
+                low=int(val.get("LOW", 0)),
+                unknown=int(val.get("UNKNOWN", 0)),
+            )
+
+    sonarqube_quality_gate = None
+    sonar_status = (summary.get("tool_status") or {}).get("sonar-scanner")
+    if isinstance(sonar_status, dict):
+        sonarqube_quality_gate = "AVAILABLE" if sonar_status.get("available") else "UNAVAILABLE"
+
+    return ScanSummary(
+        scan_id=scan_id,
+        gate_passed=(verdict.get("status") == "PASS"),
+        totals=totals,
+        findings_by_type=findings_by_type if findings_by_type else None,
+        sbom_component_count=None,
+        secrets_found=None,
+        sonarqube_quality_gate=sonarqube_quality_gate,
+        pipeline="unified-prepush",
+        build_number=None,
     )

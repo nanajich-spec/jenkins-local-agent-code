@@ -107,6 +107,29 @@ curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --output /
 curl -sL http://132.186.17.22:9091/scan | bash -s -- --user $(whoami) --json --quiet
 ```
 
+### Unified Pre-Push Scan (Local Gate + Consolidated Report)
+
+Use the unified pre-push command to run deterministic phases locally:
+
+```bash
+# detect -> test -> coverage -> security -> aggregate
+bash jenkins/scripts/pre-push-scan.sh --path . --mode code-only
+
+# strict blocking mode
+bash jenkins/scripts/pre-push-scan.sh --path . --mode full --strict
+
+# image scan mode with registry image
+bash jenkins/scripts/pre-push-scan.sh --mode image-only --image-name catool --image-tag latest
+```
+
+Outputs are stored in a timestamped local directory under `./security-reports/`:
+
+- `scan-metadata.json` (scan id, adapters, detection signals)
+- `phase-state.jsonl` (structured phase timings/status)
+- `final-report.json` (consolidated machine-readable summary)
+- `final-report.md` (developer-readable final report)
+- per-adapter and per-tool raw artifacts for traceability
+
 ### Save Locally for Repeated Use
 
 ```bash
@@ -274,6 +297,14 @@ Or share the landing page URL: `http://132.186.17.22:9091/`
 | Jenkins UI | `http://132.186.17.22:32000` | Pipeline management |
 | Registry | `http://132.186.17.22:5000` | Container images |
 | Registry UI | `http://132.186.17.22:8080` | Browse images |
+
+### Unified Scan Contract Parameters (Jenkins)
+
+The pipeline trigger scripts now forward these contract parameters for consistency with local pre-push mode:
+
+- `UNIFIED_SCAN_MODE` → `code-only | full | image-only | k8s-manifests`
+- `STRICT_MODE` → `true | false`
+- `LOCAL_REPORT_DIR` → logical local report directory convention
 
 ### Troubleshooting
 

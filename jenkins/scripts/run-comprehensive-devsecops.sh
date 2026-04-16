@@ -43,6 +43,9 @@ REGISTRY="132.186.17.22:5000"
 GIT_REPO=""
 GIT_BRANCH="main"
 COVERAGE_THRESHOLD="70"
+SCAN_MODE="code-only"
+STRICT_MODE="false"
+LOCAL_REPORT_DIR="pipeline-reports"
 GENERATE_SBOM="true"
 RUN_SONARQUBE="true"
 RUN_TRIVY="true"
@@ -63,6 +66,9 @@ while [[ $# -gt 0 ]]; do
         --git-repo)       GIT_REPO="$2"; shift 2 ;;
         --branch)         GIT_BRANCH="$2"; shift 2 ;;
         --coverage)       COVERAGE_THRESHOLD="$2"; shift 2 ;;
+        --scan-mode)      SCAN_MODE="$2"; shift 2 ;;
+        --strict-mode)    STRICT_MODE="true"; shift ;;
+        --local-report-dir) LOCAL_REPORT_DIR="$2"; shift 2 ;;
         --sonar-key)      SONAR_PROJECT_KEY="$2"; shift 2 ;;
         --agent)          AGENT_LABEL="$2"; shift 2 ;;
         --no-sbom)        GENERATE_SBOM="false"; shift ;;
@@ -87,6 +93,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --git-repo <url>     Git repository URL"
             echo "  --branch <branch>    Git branch (default: main)"
             echo "  --coverage <pct>     Coverage threshold % (default: 70)"
+            echo "  --scan-mode <mode>   full|code-only|image-only|k8s-manifests (default: code-only)"
+            echo "  --strict-mode        Enable blocking gate mode"
+            echo "  --local-report-dir   Local report directory hint (default: pipeline-reports)"
             echo "  --sonar-key <key>    SonarQube project key"
             echo "  --agent <label>      Jenkins agent label"
             echo "  --no-sbom            Skip SBOM generation"
@@ -122,6 +131,9 @@ echo "║  Registry:       ${REGISTRY}"
 echo "║  Git Repo:       ${GIT_REPO:-workspace}"
 echo "║  Branch:         ${GIT_BRANCH}"
 echo "║  Coverage:       ${COVERAGE_THRESHOLD}%"
+echo "║  Scan Mode:      ${SCAN_MODE}"
+echo "║  Strict Mode:    ${STRICT_MODE}"
+echo "║  Report Dir:     ${LOCAL_REPORT_DIR}"
 echo "║  SBOM:           ${GENERATE_SBOM}"
 echo "║  SonarQube:      ${RUN_SONARQUBE}"
 echo "║  Trivy:          ${RUN_TRIVY}"
@@ -149,6 +161,9 @@ if [ -n "${JENKINS_TOKEN}" ]; then
     PARAMS="${PARAMS}&GIT_REPO=${GIT_REPO}"
     PARAMS="${PARAMS}&GIT_BRANCH=${GIT_BRANCH}"
     PARAMS="${PARAMS}&COVERAGE_THRESHOLD=${COVERAGE_THRESHOLD}"
+    PARAMS="${PARAMS}&UNIFIED_SCAN_MODE=${SCAN_MODE}"
+    PARAMS="${PARAMS}&STRICT_MODE=${STRICT_MODE}"
+    PARAMS="${PARAMS}&LOCAL_REPORT_DIR=${LOCAL_REPORT_DIR}"
     PARAMS="${PARAMS}&GENERATE_SBOM=${GENERATE_SBOM}"
     PARAMS="${PARAMS}&RUN_SONARQUBE=${RUN_SONARQUBE}"
     PARAMS="${PARAMS}&RUN_TRIVY_SCAN=${RUN_TRIVY}"

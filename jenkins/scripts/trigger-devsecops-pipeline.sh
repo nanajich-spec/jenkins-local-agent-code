@@ -58,6 +58,9 @@ DOCKERFILE="Dockerfile"
 RUN_UNIT_TESTS="true"
 RUN_INTEGRATION_TESTS="false"
 COVERAGE_THRESHOLD="70"
+SCAN_MODE="code-only"
+STRICT_MODE="false"
+LOCAL_REPORT_DIR="pipeline-reports"
 PYTEST_ARGS=""
 RUN_TRIVY="true"
 RUN_SECRETS="true"
@@ -86,6 +89,9 @@ while [[ $# -gt 0 ]]; do
         --registry)         REGISTRY="$2"; shift 2;;
         --dockerfile)       DOCKERFILE="$2"; shift 2;;
         --coverage)         COVERAGE_THRESHOLD="$2"; shift 2;;
+        --scan-mode)        SCAN_MODE="$2"; shift 2;;
+        --strict-mode)      STRICT_MODE="true"; shift;;
+        --local-report-dir) LOCAL_REPORT_DIR="$2"; shift 2;;
         --pytest-args)      PYTEST_ARGS="$2"; shift 2;;
         --skip-tests)       RUN_UNIT_TESTS="false"; shift;;
         --skip-security)    RUN_TRIVY="false"; RUN_SECRETS="false"; RUN_K8S_SCAN="false"; RUN_DOCKERFILE_LINT="false"; shift;;
@@ -113,6 +119,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --registry URL        Container registry (default: 132.186.17.22:5000)"
             echo "  --dockerfile PATH     Dockerfile path (default: Dockerfile)"
             echo "  --coverage PCT        Minimum coverage % (default: 70)"
+            echo "  --scan-mode MODE      full|code-only|image-only|k8s-manifests (default: code-only)"
+            echo "  --strict-mode         Enable blocking gate mode"
+            echo "  --local-report-dir D  Local report directory name/path hint (default: pipeline-reports)"
             echo "  --pytest-args ARGS    Extra pytest arguments"
             echo "  --skip-tests          Skip unit tests"
             echo "  --skip-security       Skip all security scans"
@@ -153,6 +162,9 @@ PARAMS+="DOCKERFILE_PATH=${DOCKERFILE}&"
 PARAMS+="RUN_UNIT_TESTS=${RUN_UNIT_TESTS}&"
 PARAMS+="RUN_INTEGRATION_TESTS=${RUN_INTEGRATION_TESTS}&"
 PARAMS+="COVERAGE_THRESHOLD=${COVERAGE_THRESHOLD}&"
+PARAMS+="UNIFIED_SCAN_MODE=${SCAN_MODE}&"
+PARAMS+="STRICT_MODE=${STRICT_MODE}&"
+PARAMS+="LOCAL_REPORT_DIR=${LOCAL_REPORT_DIR}&"
 PARAMS+="PYTEST_ARGS=${PYTEST_ARGS}&"
 PARAMS+="RUN_TRIVY_SCAN=${RUN_TRIVY}&"
 PARAMS+="RUN_SECRET_DETECTION=${RUN_SECRETS}&"
@@ -178,6 +190,8 @@ echo "║  Language:   ${LANGUAGE}"
 echo "║  Image:      ${IMAGE_NAME:-N/A}:${IMAGE_TAG}"
 echo "║  Tests:      Unit=${RUN_UNIT_TESTS}"
 echo "║  Security:   Trivy=${RUN_TRIVY}  Secrets=${RUN_SECRETS}  K8s=${RUN_K8S_SCAN}"
+echo "║  Scan Mode:  ${SCAN_MODE}  Strict: ${STRICT_MODE}"
+echo "║  Report Dir: ${LOCAL_REPORT_DIR}"
 echo "║  SBOM:       ${GENERATE_SBOM}  SonarQube:  ${RUN_SONARQUBE}"
 echo "║  Timeout:    ${TIMEOUT}min  ForceReinstall: ${FORCE_TOOL_REINSTALL}"
 echo "╚══════════════════════════════════════════════════════════════╝"

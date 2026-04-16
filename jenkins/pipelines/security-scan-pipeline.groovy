@@ -600,7 +600,7 @@ gate_color = '#2e7d32' if gate_status == 'PASS' else '#d32f2f'
 gate_icon = '&#10004;' if gate_status == 'PASS' else '&#10008;'
 
 html = []
-html.append("""<!DOCTYPE html>
+html.append('''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Security Scan Report</title>
 <style>
@@ -622,7 +622,7 @@ td{padding:9px 12px;border-bottom:1px solid #f0f0f0}tr:hover{background:#f8f9ff}
 .box.cr .n{color:#d32f2f}.box.hi .n{color:#e65100}.box.me .n{color:#f9a825}.box.lo .n{color:#2e7d32}.box.se .n{color:#6a1b9a}
 .mute{color:#999;font-style:italic;padding:20px}.ft{text-align:center;color:#999;font-size:.85em;padding:20px}
 .inf{display:flex;gap:24px;flex-wrap:wrap;margin-top:8px}.inf span{font-size:.93em}.inf strong{color:#aaa}
-</style></head><body><div class="wrap">""")
+</style></head><body><div class="wrap">''')
 
 html.append('<div class="hdr"><h1>&#128274; Security Scan Report</h1>')
 html.append('<div class="meta"><div class="inf">')

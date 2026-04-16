@@ -41,6 +41,9 @@ pipeline {
     environment {
         REGISTRY             = "${params.REGISTRY ?: '132.186.17.22:5000'}"
         REPORTS_DIR          = "${WORKSPACE}/pipeline-reports"
+        UNIFIED_SCAN_MODE    = "${params.UNIFIED_SCAN_MODE ?: 'code-only'}"
+        STRICT_MODE          = "${params.STRICT_MODE ?: false}"
+        LOCAL_REPORT_DIR     = "${params.LOCAL_REPORT_DIR ?: 'pipeline-reports'}"
         COVERAGE_THRESHOLD   = "${params.COVERAGE_THRESHOLD ?: '70'}"
         SCAN_SEVERITY        = 'CRITICAL,HIGH'
         TRIVY_CACHE_DIR      = '/opt/trivy-cache'
@@ -58,6 +61,10 @@ pipeline {
         booleanParam(name: 'RUN_UNIT_TESTS',       defaultValue: true,  description: 'Run unit tests')
         booleanParam(name: 'RUN_INTEGRATION_TESTS', defaultValue: false, description: 'Run integration tests')
         string(name: 'COVERAGE_THRESHOLD',          defaultValue: '70',  description: 'Min code coverage %')
+        choice(name: 'UNIFIED_SCAN_MODE',           choices: ['code-only','full','image-only','k8s-manifests'], description: 'Unified scan mode contract')
+        booleanParam(name: 'STRICT_MODE',           defaultValue: false, description: 'Enable blocking gate mode')
+        string(name: 'LOCAL_REPORT_DIR',            defaultValue: 'pipeline-reports', description: 'Local report directory convention')
+        booleanParam(name: 'RUN_UNIFIED_PREPUSH',   defaultValue: false, description: 'Run adapter-driven unified pre-push orchestration')
         string(name: 'PYTEST_ARGS',                 defaultValue: '',    description: 'Extra pytest arguments')
         booleanParam(name: 'RUN_TRIVY_SCAN',        defaultValue: true,  description: 'Trivy filesystem + image scan')
         booleanParam(name: 'RUN_SECRET_DETECTION',   defaultValue: true,  description: 'Secret detection scan')
@@ -326,7 +333,7 @@ def detect_lang(d):
     return None
 
 def find_test_dirs(module_dir, lang):
-    """Walk module_dir and collect all directories that contain test code."""
+    '''Walk module_dir and collect all directories that contain test code.'''
     found = set()
     test_dir_names = {'tests', 'test', '__tests__', 'spec', 'specs', 'e2e'}
     for root, dirs, files in os.walk(module_dir):
@@ -373,7 +380,7 @@ def find_test_dirs(module_dir, lang):
     return sorted(found)
 
 def get_makefiles(module_dir):
-    """Find all Makefiles in module_dir tree and inspect their targets."""
+    '''Find all Makefiles in module_dir tree and inspect their targets.'''
     result = []
     for root, dirs, files in os.walk(module_dir):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
@@ -405,7 +412,7 @@ def get_makefiles(module_dir):
     return result
 
 def get_dockerfiles(module_dir):
-    """Find all Dockerfiles in module_dir tree."""
+    '''Find all Dockerfiles in module_dir tree.'''
     found = []
     for root, dirs, files in os.walk(module_dir):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
@@ -652,7 +659,7 @@ REPORTS_DIR = os.environ['REPORTS_DIR']
 modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     result = subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE)
     return result.returncode
 
@@ -739,7 +746,7 @@ REPORTS_DIR = os.environ['REPORTS_DIR']
 modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None, capture=False):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     kwargs = dict(shell=True, cwd=cwd or WORKSPACE)
     if capture:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
@@ -822,7 +829,7 @@ PYTEST_ARGS       = os.environ.get('PYTEST_ARGS', '')
 modules           = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     rc = subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
     print(f'     → exit {rc}')
     return rc
@@ -960,7 +967,7 @@ REPORTS_DIR = os.environ['REPORTS_DIR']
 modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
 
 int_names = {'integration', 'e2e', 'functional', 'acceptance', 'api'}
@@ -1032,7 +1039,7 @@ os.makedirs(SBOM_DIR, exist_ok=True)
 modules     = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
 
 for key, m in modules.items():
@@ -1271,7 +1278,7 @@ IMAGE_NAME = os.environ.get('IMAGE_NAME', '')
 modules    = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
 
 for key, m in modules.items():
@@ -1376,11 +1383,11 @@ modules    = json.loads(open(os.path.join(REPORTS_DIR, 'modules.json')).read())
 built_images = []
 
 def run(cmd, cwd=None):
-    print(f'  \\$ {cmd}')
+    print(f'  \$ {cmd}')
     return subprocess.run(cmd, shell=True, cwd=cwd or WORKSPACE).returncode
 
 def build_image(tag, dockerfile, context):
-    """Try podman first, then docker."""
+    '''Try podman first, then docker.'''
     for rt in ('podman', 'docker'):
         if subprocess.run(f'command -v {rt}', shell=True,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
@@ -1852,6 +1859,40 @@ fi
                         kubectl rollout status deployment/${imgName} \
                             -n ${ns} --timeout=300s 2>/dev/null || true
                     """
+                }
+            }
+        }
+
+        // =====================================================================
+        // STAGE 18: Unified Adapter-Driven Pre-Push Orchestration (optional)
+        // =====================================================================
+        stage('Unified Pre-Push Orchestration') {
+            when { expression { params.RUN_UNIFIED_PREPUSH } }
+            steps {
+                script {
+                    def result = unifiedPrePushScan(
+                        scriptPath: "${WORKSPACE}/jenkins/scripts/unified_prepush_scan.py",
+                        projectPath: env.SOURCE_ROOT ?: WORKSPACE,
+                        mode: params.UNIFIED_SCAN_MODE,
+                        strictMode: params.STRICT_MODE,
+                        outputDir: "${REPORTS_DIR}/unified",
+                        coverageThreshold: params.COVERAGE_THRESHOLD,
+                        runSonar: params.RUN_SONARQUBE,
+                        runTrivy: params.RUN_TRIVY_SCAN,
+                        generateSbom: params.GENERATE_SBOM,
+                        imageName: params.IMAGE_NAME,
+                        imageTag: params.IMAGE_TAG,
+                        registry: params.REGISTRY,
+                    )
+
+                    echo "Unified pre-push orchestration: ${result}"
+                    if (result?.reportPath) {
+                        sh "cp '${result.reportPath}' '${REPORTS_DIR}/final-report.json' 2>/dev/null || true"
+                    }
+
+                    if (params.STRICT_MODE && result?.gate == 'FAIL') {
+                        error('Unified pre-push gate failed in strict mode')
+                    }
                 }
             }
         }

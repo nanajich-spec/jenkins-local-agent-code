@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     # ── Jenkins ────────────────────────────────────────────
-    jenkins_url: str = "http://132.186.17.25:32000"
+    jenkins_url: str = "http://132.186.17.22:32000"
     jenkins_user: str = "admin"
-    jenkins_token: str = ""          # Jenkins API token (set via env)
+    jenkins_token: str = "admin"     # Jenkins API token / password
 
     # ── Storage ────────────────────────────────────────────
     upload_dir: str = "/opt/scan-uploads"

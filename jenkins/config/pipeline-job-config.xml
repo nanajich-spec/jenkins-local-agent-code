@@ -28,6 +28,28 @@
           </choices>
           <description>Type of security scan</description>
         </hudson.model.ChoiceParameterDefinition>
+                <hudson.model.ChoiceParameterDefinition>
+                    <name>UNIFIED_SCAN_MODE</name>
+                    <choices class="java.util.Arrays$ArrayList">
+                        <a class="string-array">
+                            <string>code-only</string>
+                            <string>full</string>
+                            <string>image-only</string>
+                            <string>k8s-manifests</string>
+                        </a>
+                    </choices>
+                    <description>Unified scan mode contract</description>
+                </hudson.model.ChoiceParameterDefinition>
+                <hudson.model.BooleanParameterDefinition>
+                    <name>STRICT_MODE</name>
+                    <defaultValue>false</defaultValue>
+                    <description>Enable blocking gate mode</description>
+                </hudson.model.BooleanParameterDefinition>
+                <hudson.model.StringParameterDefinition>
+                    <name>LOCAL_REPORT_DIR</name>
+                    <defaultValue>security-reports</defaultValue>
+                    <description>Local report directory convention</description>
+                </hudson.model.StringParameterDefinition>
         <hudson.model.BooleanParameterDefinition>
           <name>FAIL_ON_CRITICAL</name>
           <defaultValue>true</defaultValue>
@@ -110,7 +132,8 @@
                     ==========================================
                       Security Scan Pipeline
                     ==========================================
-                      Scan Type:   ${params.SCAN_TYPE}
+                      Scan Type:   ${params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE}
+                      Strict:      ${params.STRICT_MODE}
                       Scan ID:     ${params.SCAN_ID ?: 'N/A'}
                       Image:       ${env.REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}
                       Source Dir:  ${env.SOURCE_DIR}
@@ -121,7 +144,7 @@
             }
         }
         stage('Secret Detection') {
-            when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
+            when { expression { (params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE) in ['full', 'code-only'] } }
             steps {
                 script {
                     def scanDir = env.SOURCE_DIR ?: WORKSPACE
@@ -132,7 +155,7 @@
             }
         }
         stage('SAST / Vulnerability Scan') {
-            when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
+            when { expression { (params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE) in ['full', 'code-only'] } }
             steps {
                 script {
                     def scanDir = env.SOURCE_DIR ?: WORKSPACE
@@ -143,7 +166,7 @@
             }
         }
         stage('SCA / Dependency Scan') {
-            when { expression { params.SCAN_TYPE in ['full', 'code-only'] } }
+            when { expression { (params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE) in ['full', 'code-only'] } }
             steps {
                 script {
                     def scanDir = env.SOURCE_DIR ?: WORKSPACE
@@ -154,7 +177,7 @@
             }
         }
         stage('Image Scan') {
-            when { expression { params.SCAN_TYPE in ['full', 'image-only'] } }
+            when { expression { (params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE) in ['full', 'image-only'] } }
             steps {
                 script {
                     def img = "${env.REGISTRY}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
@@ -165,7 +188,7 @@
             }
         }
         stage('K8s Manifest Scan') {
-            when { expression { params.SCAN_TYPE in ['full', 'k8s-manifests'] } }
+            when { expression { (params.UNIFIED_SCAN_MODE ?: params.SCAN_TYPE) in ['full', 'k8s-manifests'] } }
             steps {
                 script {
                     // If user uploaded source with K8s manifests, scan those
